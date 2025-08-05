@@ -34,7 +34,7 @@ router.post('/', authenticateToken, validatePregnancy, async (req, res) => {
     const { data: existingPregnancy, error: checkError } = await supabase
       .from('pregnancies')
       .select('id')
-      .eq('user_id', req.user.userId) // Fixed: use userId from JWT payload
+      .eq('user_id', req.user.id) // Fixed: use userId from JWT payload
       .eq('status', 'active')
       .maybeSingle();
 
@@ -51,7 +51,7 @@ router.post('/', authenticateToken, validatePregnancy, async (req, res) => {
     const { data: pregnancy, error } = await supabase
       .from('pregnancies')
       .insert([{
-        user_id: req.user.userId, // Fixed: use userId from JWT payload
+        user_id: req.user.id, // Fixed: use userId from JWT payload
         start_date,
         due_date,
         status: 'active',
@@ -66,7 +66,7 @@ router.post('/', authenticateToken, validatePregnancy, async (req, res) => {
       return res.status(500).json({ error: 'Failed to create pregnancy record' });
     }
 
-    logger.info(`Pregnancy record created for user ${req.user.userId}`);
+    logger.info(`Pregnancy record created for user ${req.user.id}`);
 
     res.status(201).json({
       message: 'Pregnancy record created successfully',
@@ -87,7 +87,7 @@ router.get('/', authenticateToken, async (req, res) => {
     const { data: pregnancies, error } = await supabase
       .from('pregnancies')
       .select('*')
-      .eq('user_id', req.user.userId) // Fixed: use userId from JWT payload
+      .eq('user_id', req.user.id) // Fixed: use userId from JWT payload
       .order('created_at', { ascending: false });
 
     if (error) {
@@ -111,7 +111,7 @@ router.get('/current', authenticateToken, async (req, res) => {
     const { data: pregnancy, error } = await supabase
       .from('pregnancies')
       .select('*')
-      .eq('user_id', req.user.userId) // Fixed: use userId from JWT payload
+      .eq('user_id', req.user.id) // Fixed: use userId from JWT payload
       .eq('status', 'active')
       .maybeSingle();
 
@@ -160,7 +160,7 @@ router.patch('/:id/status', authenticateToken, async (req, res) => {
         updated_at: new Date().toISOString()
       })
       .eq('id', id)
-      .eq('user_id', req.user.userId) // Fixed: use userId from JWT payload
+      .eq('user_id', req.user.id) // Fixed: use userId from JWT payload
       .select()
       .single();
 
@@ -240,7 +240,7 @@ router.get('/stats', authenticateToken, async (req, res) => {
     const { data: pregnancies, error } = await supabase
       .from('pregnancies')
       .select('status')
-      .eq('user_id', req.user.userId);
+      .eq('user_id', req.user.id);
 
     if (error) {
       logger.error('Get pregnancy stats error:', error);
