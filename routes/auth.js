@@ -35,7 +35,7 @@ router.post('/register', validateRegistration, async (req, res) => {
       .from('users')
       .select('id')
       .eq('email', email)
-      .maybeSingle(); // Use maybeSingle() instead of single() to avoid error when no user exists
+      .maybeSingle();
 
     if (checkError) {
       logger.error('Database check error:', checkError);
@@ -50,7 +50,7 @@ router.post('/register', validateRegistration, async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user - let database generate UUID
+    // Create user
     const { data: user, error } = await supabase
       .from('users')
       .insert([{
@@ -152,24 +152,138 @@ router.post('/login', validateLogin, async (req, res) => {
 // Get current user
 router.get('/me', authenticateToken, async (req, res) => {
   try {
+    // Validate user ID
+    if (!req.user.id) {
+      logger.error('Invalid or missing user id in request');
+      return res.status(401).json({ error: 'Invalid authentication token' });
+    }
+
     const supabase = getSupabaseClient();
 
     const { data: user, error } = await supabase
       .from('users')
       .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled')
-      .eq('id', req.user.userId)
+      .eq('id', req.user.id.toString())
       .is('deleted_at', null)
       .single();
 
     if (error || !user) {
-      logger.error('Get user error:', error);
+      logger.error(`Get user error for id ${req.user.id}:`, error);
       return res.status(401).json({ error: 'User not found' });
     }
 
     res.json({ user });
 
   } catch (error) {
-    logger.error('Get user error:', error);
+    logger.error(`Get user error for id ${req.user.id || 'unknown'}:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get user profile
+router.get('/profile', authenticateToken, async (req, res) => {
+  try {
+    // Validate user ID
+    if (!req.user.id) {
+      logger.error('Invalid or missing user id in request');
+      return res.status(401).json({ error: 'Invalid authentication token' });
+    }
+
+    // Log user ID for debugging
+    logger.info(`Fetching profile for id: ${req.user.id}`);
+
+    const supabase = getSupabaseClient();
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled, profile_image')
+      .eq('id', req.user.id.toString())
+      .is('deleted_at', null)
+      .single();
+
+    if (error || !user) {
+      logger.error(`Get profile error for id ${req.user.id}:`, error);
+      return res.status(401).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: 'Profile retrieved successfully',
+      user
+    });
+
+  } catch (error) {
+    logger.error(`Get profile error for id ${req.user.id || 'unknown'}:`, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update user profile
+router.patch('/profile', authenticateToken, async (req, res) => {
+  try {
+    // Validate user ID
+    if (!req.user.id) {
+      logger.error('Invalid or missing user id in request');
+      return res.status(401).json({ error: 'Invalid authentication token' });
+    }
+
+    // Log user ID for debugging
+    logger.info(`Updating profile for id: ${req.user.id}`);
+
+    const { name, email, phone, profile_image } = req.body;
+    const supabase = getSupabaseClient();
+
+    // Validate input
+    if (!name && !email && !phone && !profile_image) {
+      return res.status(400).json({ error: 'At least one field must be provided for update' });
+    }
+
+    // Check if email is already in use by another user
+    if (email) {
+      const { data: existingUser, error: checkError } = await supabase
+        .from('users')
+        .select('id')
+        .eq('email', email)
+        .neq('id', req.user.id.toString())
+        .maybeSingle();
+
+      if (checkError) {
+        logger.error(`Email check error for id ${req.user.id}:`, checkError);
+        return res.status(500).json({ error: 'Database error' });
+      }
+
+      if (existingUser) {
+        return res.status(409).json({ error: 'Email already in use' });
+      }
+    }
+
+    // Prepare update object
+    const updateData = {};
+    if (name) updateData.full_name = name;
+    if (email) updateData.email = email;
+    if (phone) updateData.phone_number = phone;
+    if (profile_image) updateData.profile_image = profile_image;
+    updateData.updated_at = new Date().toISOString();
+
+    // Update user in database
+    const { data: updatedUser, error } = await supabase
+      .from('users')
+      .update(updateData)
+      .eq('id', req.user.id.toString())
+      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled, profile_image')
+      .single();
+
+    if (error) {
+      logger.error(`Profile update error for id ${req.user.id}:`, error);
+      return res.status(500).json({ error: 'Failed to update profile' });
+    }
+
+    res.json({
+      message: 'Profile updated successfully',
+      user: updatedUser
+    });
+
+  } catch (error) {
+    logger.error(`Profile update error for id ${req.user.id || 'unknown'}:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -177,6 +291,12 @@ router.get('/me', authenticateToken, async (req, res) => {
 // Delete user account (soft delete)
 router.delete('/me', authenticateToken, async (req, res) => {
   try {
+    // Validate user ID
+    if (!req.user.id) {
+      logger.error('Invalid or missing user id in request');
+      return res.status(401).json({ error: 'Invalid authentication token' });
+    }
+
     const supabase = getSupabaseClient();
 
     // Soft delete user
@@ -187,19 +307,19 @@ router.delete('/me', authenticateToken, async (req, res) => {
         email: null, 
         phone_number: null 
       })
-      .eq('id', req.user.userId);
+      .eq('id', req.user.id.toString());
 
     if (error) {
-      logger.error('User deletion error:', error);
+      logger.error(`User deletion error for id ${req.user.id}:`, error);
       return res.status(500).json({ error: 'Failed to delete user data' });
     }
 
     // Log deletion for audit
-    logger.info(`User ${req.user.userId} requested data deletion`);
+    logger.info(`User ${req.user.id} requested data deletion`);
 
     res.json({ message: 'User data deleted successfully' });
   } catch (error) {
-    logger.error('User deletion error:', error);
+    logger.error(`User deletion error for id ${req.user.id || 'unknown'}:`, error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -258,7 +378,7 @@ router.post('/password-reset', async (req, res) => {
     // Send email (only if environment variables are set)
     if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
       try {
-        const transporter = nodemailer.createTransporter({
+        const transporter = nodemailer.createTransport({
           service: 'gmail',
           auth: {
             user: process.env.EMAIL_USER,
@@ -327,7 +447,7 @@ router.post('/password-reset/verify', async (req, res) => {
       .update({ password_hash, updated_at: new Date().toISOString() })
       .eq('id', reset.user_id);
 
-    if (updateError) {
+    if (error) {
       logger.error('Error updating password:', updateError);
       return res.status(500).json({ error: 'Failed to update password' });
     }
@@ -364,7 +484,7 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
     const { error } = await supabase
       .from('users')
       .update({ phone_number, two_factor_enabled: true })
-      .eq('id', req.user.userId);
+      .eq('id', req.user.id);
 
     if (error) {
       logger.error('Error enabling 2FA:', error);
@@ -402,95 +522,6 @@ router.post('/verify-2fa', async (req, res) => {
     res.json({ message: '2FA verification successful' });
   } catch (error) {
     logger.error('Verify 2FA error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-router.get('/profile', authenticateToken, async (req, res) => {
-  try {
-    const supabase = getSupabaseClient();
-
-    const { data: user, error } = await supabase
-      .from('users')
-      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled, profile_image')
-      .eq('id', req.user.userId)
-      .is('deleted_at', null)
-      .single();
-
-    if (error || !user) {
-      logger.error('Get profile error:', error);
-      return res.status(401).json({ error: 'User not found' });
-    }
-
-    res.json({
-      message: 'Profile retrieved successfully',
-      user
-    });
-
-  } catch (error) {
-    logger.error('Get profile error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Update user profile
-router.patch('/profile', authenticateToken, async (req, res) => {
-  try {
-    const { name, email, phone, profile_image } = req.body;
-    const supabase = getSupabaseClient();
-
-    // Validate input
-    if (!name && !email && !phone && !profile_image) {
-      return res.status(400).json({ error: 'At least one field must be provided for update' });
-    }
-
-    // Check if email is already in use by another user
-    if (email) {
-      const { data: existingUser, error: checkError } = await supabase
-        .from('users')
-        .select('id')
-        .eq('email', email)
-        .neq('id', req.user.userId)
-        .maybeSingle();
-
-      if (checkError) {
-        logger.error('Email check error:', checkError);
-        return res.status(500).json({ error: 'Database error' });
-      }
-
-      if (existingUser) {
-        return res.status(409).json({ error: 'Email already in use' });
-      }
-    }
-
-    // Prepare update object
-    const updateData = {};
-    if (name) updateData.full_name = name;
-    if (email) updateData.email = email;
-    if (phone) updateData.phone_number = phone;
-    if (profile_image) updateData.profile_image = profile_image;
-    updateData.updated_at = new Date().toISOString();
-
-    // Update user in database
-    const { data: updatedUser, error } = await supabase
-      .from('users')
-      .update(updateData)
-      .eq('id', req.user.userId)
-      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled, profile_image')
-      .single();
-
-    if (error) {
-      logger.error('Profile update error:', error);
-      return res.status(500).json({ error: 'Failed to update profile' });
-    }
-
-    res.json({
-      message: 'Profile updated successfully',
-      user: updatedUser
-    });
-
-  } catch (error) {
-    logger.error('Profile update error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
