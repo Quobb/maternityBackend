@@ -3700,3 +3700,10 @@
 {"level":"info","message":"✅ Redis initialized successfully","service":"maternity-monitoring","timestamp":"2025-08-05T13:11:21.673Z"}
 {"level":"info","message":"Fetching profile for id: f0c34318-e76d-4fa2-b7a3-49953a404b9f","service":"maternity-monitoring","timestamp":"2025-08-05T13:11:45.034Z"}
 {"level":"info","message":"::1 - - [05/Aug/2025:13:11:45 +0000] \"GET /api/auth/profile HTTP/1.1\" 200 353 \"-\" \"PostmanRuntime/7.44.0\"","service":"maternity-monitoring","timestamp":"2025-08-05T13:11:45.333Z"}
+{"level":"info","message":"✅ Supabase initialized successfully","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:14.792Z"}
+{"level":"info","message":"✅ Cloudinary initialized successfully","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:14.812Z"}
+{"level":"info","message":"✅ Real-time subscriptions initialized","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:14.982Z"}
+{"level":"info","message":"Appointment reminder cron job scheduled","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:15.042Z"}
+{"level":"info","message":"🚀 Maternity Monitoring Server running on port 3000","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:16.265Z"}
+{"level":"info","message":"Environment: development","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:16.266Z"}
+{"level":"info","message":"✅ Redis initialized successfully","service":"maternity-monitoring","timestamp":"2025-08-05T13:16:17.311Z"}

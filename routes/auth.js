@@ -8,13 +8,21 @@ const logger = require('../utils/logger');
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
 const { authenticateToken } = require('../middleware/auth');
+const cloudinary = require('cloudinary').v2;
 
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 const router = express.Router();
 
+// Configure Cloudinary
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
 // Helper function to validate environment variables
 const validateEnvVars = () => {
-  const required = ['JWT_SECRET', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'];
+  const required = ['JWT_SECRET', 'SUPABASE_URL', 'SUPABASE_ANON_KEY', 'CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
   const missing = required.filter(key => !process.env[key]);
   
   if (missing.length > 0) {
@@ -261,7 +269,22 @@ router.patch('/profile', authenticateToken, async (req, res) => {
     if (name) updateData.full_name = name;
     if (email) updateData.email = email;
     if (phone) updateData.phone_number = phone;
-    if (profile_image) updateData.profile_image = profile_image;
+
+    // Handle profile image upload to Cloudinary
+    if (profile_image) {
+      try {
+        const uploadResult = await cloudinary.uploader.upload(profile_image, {
+          folder: 'profile_images',
+          resource_type: 'image',
+          transformation: [{ width: 200, height: 200, crop: 'fill' }],
+        });
+        updateData.profile_image = uploadResult.secure_url;
+      } catch (uploadError) {
+        logger.error(`Cloudinary upload error for id ${req.user.id}:`, uploadError);
+        return res.status(500).json({ error: 'Failed to upload profile image' });
+      }
+    }
+
     updateData.updated_at = new Date().toISOString();
 
     // Update user in database
