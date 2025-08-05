@@ -7,26 +7,40 @@ const { validateRegistration, validateLogin } = require('../middleware/validatio
 const logger = require('../utils/logger');
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
-
 const { authenticateToken } = require('../middleware/auth');
 
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
-
-
 const router = express.Router();
+
+// Helper function to validate environment variables
+const validateEnvVars = () => {
+  const required = ['JWT_SECRET', 'SUPABASE_URL', 'SUPABASE_ANON_KEY'];
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
+};
 
 // Register
 router.post('/register', validateRegistration, async (req, res) => {
   try {
+    validateEnvVars();
+    
     const { email, password, full_name, phone_number, role, date_of_birth } = req.body;
     const supabase = getSupabaseClient();
 
     // Check if user exists
-    const { data: existingUser } = await supabase
+    const { data: existingUser, error: checkError } = await supabase
       .from('users')
       .select('id')
       .eq('email', email)
-      .single();
+      .maybeSingle(); // Use maybeSingle() instead of single() to avoid error when no user exists
+
+    if (checkError) {
+      logger.error('Database check error:', checkError);
+      return res.status(500).json({ error: 'Database error' });
+    }
 
     if (existingUser) {
       return res.status(409).json({ error: 'User already exists' });
@@ -36,20 +50,16 @@ router.post('/register', validateRegistration, async (req, res) => {
     const saltRounds = 12;
     const password_hash = await bcrypt.hash(password, saltRounds);
 
-    // Create user
-    const userId = uuidv4();
+    // Create user - let database generate UUID
     const { data: user, error } = await supabase
       .from('users')
       .insert([{
-        id: userId,
         email,
         password_hash,
         full_name,
         phone_number,
-        role,
+        role: role || 'patient',
         date_of_birth,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
       }])
       .select()
       .single();
@@ -84,6 +94,8 @@ router.post('/register', validateRegistration, async (req, res) => {
 // Login
 router.post('/login', validateLogin, async (req, res) => {
   try {
+    validateEnvVars();
+    
     const { email, password } = req.body;
     const supabase = getSupabaseClient();
 
@@ -92,9 +104,15 @@ router.post('/login', validateLogin, async (req, res) => {
       .from('users')
       .select('*')
       .eq('email', email)
-      .single();
+      .is('deleted_at', null) // Exclude soft-deleted users
+      .maybeSingle();
 
-    if (error || !user) {
+    if (error) {
+      logger.error('Database error during login:', error);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!user) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
@@ -133,46 +151,44 @@ router.post('/login', validateLogin, async (req, res) => {
 });
 
 // Get current user
-router.get('/me', async (req, res) => {
+router.get('/me', authenticateToken, async (req, res) => {
   try {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-      return res.status(401).json({ error: 'Access token required' });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
     const supabase = getSupabaseClient();
 
     const { data: user, error } = await supabase
       .from('users')
-      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at')
-      .eq('id', decoded.userId)
+      .select('id, email, full_name, phone_number, role, date_of_birth, created_at, updated_at, two_factor_enabled')
+      .eq('id', req.user.userId)
+      .is('deleted_at', null)
       .single();
 
     if (error || !user) {
-      return res.status(401).json({ error: 'Invalid token' });
+      logger.error('Get user error:', error);
+      return res.status(401).json({ error: 'User not found' });
     }
 
     res.json({ user });
 
   } catch (error) {
     logger.error('Get user error:', error);
-    res.status(403).json({ error: 'Invalid or expired token' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// routes/auth.js (Add to existing file)
+// Delete user account (soft delete)
 router.delete('/me', authenticateToken, async (req, res) => {
   try {
     const supabase = getSupabaseClient();
 
-    // Soft delete user and related data
+    // Soft delete user
     const { error } = await supabase
       .from('users')
-      .update({ deleted_at: new Date().toISOString(), email: null, phone_number: null })
-      .eq('id', req.user.id);
+      .update({ 
+        deleted_at: new Date().toISOString(), 
+        email: null, 
+        phone_number: null 
+      })
+      .eq('id', req.user.userId);
 
     if (error) {
       logger.error('User deletion error:', error);
@@ -180,7 +196,7 @@ router.delete('/me', authenticateToken, async (req, res) => {
     }
 
     // Log deletion for audit
-    logger.info(`User ${req.user.id} requested data deletion`);
+    logger.info(`User ${req.user.userId} requested data deletion`);
 
     res.json({ message: 'User data deleted successfully' });
   } catch (error) {
@@ -193,40 +209,82 @@ router.delete('/me', authenticateToken, async (req, res) => {
 router.post('/password-reset', async (req, res) => {
   try {
     const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+
     const supabase = getSupabaseClient();
 
     const { data: user, error } = await supabase
       .from('users')
       .select('id, email')
       .eq('email', email)
-      .single();
+      .is('deleted_at', null)
+      .maybeSingle();
 
-    if (error || !user) {
-      return res.status(404).json({ error: 'User not found' });
+    if (error) {
+      logger.error('Database error during password reset:', error);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    // Always return success to prevent email enumeration
+    if (!user) {
+      return res.json({ message: 'If an account exists, password reset link has been sent' });
     }
 
     const resetToken = uuidv4();
     const expiresAt = new Date(Date.now() + 3600 * 1000); // 1 hour expiry
 
+    // Delete any existing reset tokens for this user
     await supabase
       .from('password_resets')
-      .insert([{ user_id: user.id, token: resetToken, expires_at: expiresAt.toISOString() }]);
+      .delete()
+      .eq('user_id', user.id);
 
-    const transporter = nodemailer.createTransport({
-      service: 'gmail',
-      auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS,
-      },
-    });
-JWT_SECRET
-    await transporter.sendMail({
-      to: email,
-      subject: 'Password Reset Request',
-      text: `Use this link to reset your password: ${process.env.FRONTEND_URL}/reset-password/${resetToken}`,
-    });
+    // Insert new reset token
+    const { error: insertError } = await supabase
+      .from('password_resets')
+      .insert([{ 
+        user_id: user.id, 
+        token: resetToken, 
+        expires_at: expiresAt.toISOString() 
+      }]);
 
-    res.json({ message: 'Password reset link sent' });
+    if (insertError) {
+      logger.error('Error creating password reset token:', insertError);
+      return res.status(500).json({ error: 'Failed to create reset token' });
+    }
+
+    // Send email (only if environment variables are set)
+    if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+      try {
+        const transporter = nodemailer.createTransporter({
+          service: 'gmail',
+          auth: {
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASS,
+          },
+        });
+
+        await transporter.sendMail({
+          to: email,
+          subject: 'Password Reset Request',
+          html: `
+            <h2>Password Reset Request</h2>
+            <p>Click the link below to reset your password:</p>
+            <a href="${process.env.FRONTEND_URL}/reset-password/${resetToken}">Reset Password</a>
+            <p>This link expires in 1 hour.</p>
+            <p>If you didn't request this, please ignore this email.</p>
+          `,
+        });
+      } catch (emailError) {
+        logger.error('Email sending error:', emailError);
+        // Don't fail the request if email fails
+      }
+    }
+
+    res.json({ message: 'If an account exists, password reset link has been sent' });
   } catch (error) {
     logger.error('Password reset error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -237,24 +295,45 @@ JWT_SECRET
 router.post('/password-reset/verify', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
+
+    if (!token || !newPassword) {
+      return res.status(400).json({ error: 'Token and new password are required' });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    }
+
     const supabase = getSupabaseClient();
 
     const { data: reset, error } = await supabase
       .from('password_resets')
       .select('user_id, expires_at')
       .eq('token', token)
-      .single();
+      .maybeSingle();
 
-    if (error || !reset || new Date(reset.expires_at) < new Date()) {
+    if (error) {
+      logger.error('Database error during password reset verification:', error);
+      return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!reset || new Date(reset.expires_at) < new Date()) {
       return res.status(400).json({ error: 'Invalid or expired token' });
     }
 
     const password_hash = await bcrypt.hash(newPassword, 12);
-    await supabase
+    
+    const { error: updateError } = await supabase
       .from('users')
       .update({ password_hash, updated_at: new Date().toISOString() })
       .eq('id', reset.user_id);
 
+    if (updateError) {
+      logger.error('Error updating password:', updateError);
+      return res.status(500).json({ error: 'Failed to update password' });
+    }
+
+    // Delete the used reset token
     await supabase.from('password_resets').delete().eq('token', token);
 
     res.json({ message: 'Password reset successfully' });
@@ -268,16 +347,30 @@ router.post('/password-reset/verify', async (req, res) => {
 router.post('/enable-2fa', authenticateToken, async (req, res) => {
   try {
     const { phone_number } = req.body;
+
+    if (!phone_number) {
+      return res.status(400).json({ error: 'Phone number is required' });
+    }
+
+    if (!process.env.TWILIO_VERIFY_SID) {
+      return res.status(500).json({ error: '2FA service not configured' });
+    }
+
     const supabase = getSupabaseClient();
 
     const verification = await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SID)
       .verifications.create({ to: phone_number, channel: 'sms' });
 
-    await supabase
+    const { error } = await supabase
       .from('users')
       .update({ phone_number, two_factor_enabled: true })
-      .eq('id', req.user.id);
+      .eq('id', req.user.userId);
+
+    if (error) {
+      logger.error('Error enabling 2FA:', error);
+      return res.status(500).json({ error: 'Failed to enable 2FA' });
+    }
 
     res.json({ message: '2FA enabled, verification code sent' });
   } catch (error) {
@@ -290,6 +383,14 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
 router.post('/verify-2fa', async (req, res) => {
   try {
     const { phone_number, code } = req.body;
+
+    if (!phone_number || !code) {
+      return res.status(400).json({ error: 'Phone number and code are required' });
+    }
+
+    if (!process.env.TWILIO_VERIFY_SID) {
+      return res.status(500).json({ error: '2FA service not configured' });
+    }
 
     const verificationCheck = await client.verify.v2
       .services(process.env.TWILIO_VERIFY_SID)

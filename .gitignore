@@ -12,12 +12,12 @@ pids
 *.seed
 *.pid.lock
 
-# dotenv environment files
-.env
-.env.*
+
 
 # VS Code settings (optional)
 .vscode/
+
+.env*
 
 # Build output
 dist/
