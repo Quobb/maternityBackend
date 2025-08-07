@@ -551,31 +551,31 @@ router.post('/verify-2fa', async (req, res) => {
 
 
 
-// Phone Login - Send OTP
+
+// POST /api/auth/phone-login
 router.post('/phone-login', async (req, res) => {
   try {
     const { phone_number, role } = req.body;
 
-    // Validate input
+    // Validate phone number
     if (!phone_number) {
       return res.status(400).json({ error: 'Phone number is required' });
     }
 
-    // Validate phone number format (basic validation)
     const phoneRegex = /^\+?[1-9]\d{1,14}$/;
     if (!phoneRegex.test(phone_number)) {
       return res.status(400).json({ error: 'Invalid phone number format' });
     }
 
-    // Check if Twilio is configured
-    if (!process.env.TWILIO_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_VERIFY_SID) {
-      logger.error('Twilio not configured for phone authentication');
+    // Check Twilio env
+    if (!process.env.TWILIO_VERIFY_SID || !process.env.TWILIO_SID || !process.env.TWILIO_AUTH_TOKEN) {
+      logger.error('Twilio credentials missing');
       return res.status(500).json({ error: 'Phone authentication service not available' });
     }
 
     const supabase = getSupabaseClient();
 
-    // Check if user exists with this phone number
+    // Find user
     const { data: user, error } = await supabase
       .from('users')
       .select('id, phone_number, role, full_name, email, two_factor_enabled')
@@ -584,7 +584,7 @@ router.post('/phone-login', async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      logger.error('Database error during phone login:', error);
+      logger.error('Supabase user lookup error:', error);
       return res.status(500).json({ error: 'Database error' });
     }
 
@@ -592,29 +592,28 @@ router.post('/phone-login', async (req, res) => {
       return res.status(404).json({ error: 'No account found with this phone number' });
     }
 
-    // Optional: Check if role matches (if role is provided)
+    // Optional role check
     if (role && user.role !== role) {
-      return res.status(401).json({ error: 'Invalid credentials for the specified role' });
+      return res.status(401).json({ error: 'Invalid credentials for this role' });
     }
 
+    // Send OTP
     try {
-      // Send OTP via Twilio Verify
       const verification = await client.verify.v2
         .services(process.env.TWILIO_VERIFY_SID)
-        .verifications.create({ 
-          to: phone_number, 
+        .verifications.create({
+          to: phone_number,
           channel: 'sms',
           customFriendlyName: 'Healthcare App Login'
         });
 
-      logger.info(`OTP sent to ${phone_number} for user ${user.id}`);
+      logger.info(`OTP sent to ${phone_number} (user_id: ${user.id})`);
 
-      // Store temporary session data (you might want to use Redis in production)
-      // For now, we'll create a temporary record in the database
+      // Generate session token
       const sessionToken = uuidv4();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes expiry
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min expiry
 
-      // Clean up old phone login sessions
+      // Clean up old sessions
       await supabase
         .from('phone_login_sessions')
         .delete()
@@ -632,33 +631,32 @@ router.post('/phone-login', async (req, res) => {
         }]);
 
       if (sessionError) {
-        logger.error('Error creating phone login session:', sessionError);
-        return res.status(500).json({ error: 'Failed to create login session' });
+        logger.error('Failed to create session:', sessionError);
+        return res.status(500).json({ error: 'Login session creation failed' });
       }
 
-      res.json({
+      return res.status(200).json({
         message: 'OTP sent successfully',
-        sessionToken, // Frontend will need this to verify the OTP
-        expiresIn: 600, // 10 minutes in seconds
-        phone_number: phone_number.replace(/(\d{3})\d{6}(\d{4})/, '$1****$2') // Masked phone number
+        sessionToken,
+        expiresIn: 600, // seconds
+        phone_number: phone_number.replace(/(\+\d{3})(\d{3})(\d{4})/, '$1****$3') // Masked
       });
 
     } catch (twilioError) {
-      logger.error('Twilio error:', twilioError);
-      
-      // Handle specific Twilio errors
+      logger.error('Twilio Verify error:', twilioError);
+
       if (twilioError.code === 60200) {
         return res.status(400).json({ error: 'Invalid phone number' });
       } else if (twilioError.code === 60203) {
-        return res.status(429).json({ error: 'Too many verification attempts. Please try again later.' });
+        return res.status(429).json({ error: 'Too many attempts. Try again later.' });
       }
-      
+
       return res.status(500).json({ error: 'Failed to send OTP. Please try again.' });
     }
 
-  } catch (error) {
-    logger.error('Phone login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    logger.error('Unhandled phone login error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
 });
 
