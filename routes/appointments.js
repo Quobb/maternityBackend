@@ -10,7 +10,7 @@ const router = express.Router();
 // Create appointment
 router.post('/', requireRole(['mother']), validateAppointment, async (req, res) => {
   try {
-    const { doctor_id, scheduled_at, notes } = req.body;
+    const { doctor_id, scheduled_at, notes,type } = req.body;
     const supabase = getSupabaseClient();
 
     // Verify doctor exists and has correct role
@@ -31,6 +31,7 @@ router.post('/', requireRole(['mother']), validateAppointment, async (req, res) 
       .insert([{
         id: appointmentId,
         user_id: req.user.id,
+        type,
         doctor_id,
         scheduled_at,
         status: 'scheduled',

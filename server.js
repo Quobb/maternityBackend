@@ -19,7 +19,7 @@ const { initializeRealtime } = require('./config/realtime');
 // Initialize services once
 initializeSupabase();
 initializeCloudinary();
-initializeRedis();
+// initializeRedis();
 initializeRealtime();
 scheduleReminders();
 

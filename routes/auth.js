@@ -1,17 +1,29 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
+const { body, param, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
 const { getSupabaseClient } = require('../config/database');
 const { validateRegistration, validateLogin } = require('../middleware/validation');
+const { authenticateToken } = require('../middleware/auth');
 const logger = require('../utils/logger');
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
-const { authenticateToken } = require('../middleware/auth');
 const cloudinary = require('cloudinary').v2;
 
 const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 const router = express.Router();
+
+// Constants
+const SALT_ROUNDS = 12;
+const PASSWORD_MIN_LENGTH = 8;
+const OTP_EXPIRY_MINUTES = 10;
+const RESET_TOKEN_EXPIRY_HOURS = 1;
+const MAX_FAILED_ATTEMPTS = 100;
+const LOCKOUT_DURATION_MINUTES = 15;
+const PHONE_REGEX = /^\+?[1-9]\d{1,14}$/;
 
 // Configure Cloudinary
 cloudinary.config({
@@ -20,9 +32,41 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
+// Rate limiting configurations
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts per window per IP
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const otpLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 3, // 3 OTP requests per window per IP
+  message: { error: 'Too many OTP requests. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const resetLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3, // 3 password reset attempts per hour per IP
+  message: { error: 'Too many password reset requests. Please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Helper function to validate environment variables
 const validateEnvVars = () => {
-  const required = ['JWT_SECRET', 'SUPABASE_URL', 'SUPABASE_ANON_KEY', 'CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_API_KEY', 'CLOUDINARY_API_SECRET'];
+  const required = [
+    'JWT_SECRET',
+    'SUPABASE_URL',
+    'SUPABASE_ANON_KEY',
+    'CLOUDINARY_CLOUD_NAME',
+    'CLOUDINARY_API_KEY',
+    'CLOUDINARY_API_SECRET'
+  ];
   const missing = required.filter(key => !process.env[key]);
   
   if (missing.length > 0) {
@@ -30,8 +74,118 @@ const validateEnvVars = () => {
   }
 };
 
+// Standardized response helper
+const sendResponse = (res, status, message, data = null, errors = null) => {
+  return res.status(status).json({
+    success: status < 400,
+    message,
+    data,
+    errors,
+    timestamp: new Date().toISOString()
+  });
+};
+
+// Helper function to generate secure token
+const generateSecureToken = () => {
+  return crypto.randomBytes(32).toString('hex');
+};
+
+// Helper function to check account lockout
+const checkAccountLockout = async (supabase, email) => {
+  const { data: attempts, error } = await supabase
+    .from('failed_login_attempts')
+    .select('*')
+    .eq('email', email)
+    .gte('created_at', new Date(Date.now() - LOCKOUT_DURATION_MINUTES * 60 * 1000).toISOString())
+    .order('created_at', { ascending: false });
+
+  if (error) {
+    logger.error('Failed login attempts check error:', error);
+    return { isLocked: false, attempts: 0 };
+  }
+
+  const recentAttempts = attempts?.length || 0;
+  const isLocked = recentAttempts >= MAX_FAILED_ATTEMPTS;
+  
+  return { isLocked, attempts: recentAttempts };
+};
+
+// Helper function to record failed login attempt
+const recordFailedAttempt = async (supabase, email, ip) => {
+  try {
+    await supabase
+      .from('failed_login_attempts')
+      .insert([{ email, ip_address: ip }]);
+  } catch (error) {
+    logger.error('Failed to record login attempt:', error);
+  }
+};
+
+// Helper function to clear failed login attempts
+const clearFailedAttempts = async (supabase, email) => {
+  try {
+    await supabase
+      .from('failed_login_attempts')
+      .delete()
+      .eq('email', email);
+  } catch (error) {
+    logger.error('Failed to clear login attempts:', error);
+  }
+};
+
+// Validation middleware for profile creation
+const validateProfileCreation = [
+  body('age')
+    .optional()
+    .isInt({ min: 0, max: 120 })
+    .withMessage('Age must be a valid integer between 0 and 120'),
+  body('bmi')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 50 })
+    .withMessage('BMI must be a string with max 50 characters'),
+  body('medical_conditions')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 1000 })
+    .withMessage('Medical conditions must be a string with max 1000 characters'),
+  body('previous_pregnancies')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 500 })
+    .withMessage('Previous pregnancies must be a string with max 500 characters'),
+  body('gestational_week')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 50 })
+    .withMessage('Gestational week must be a string with max 50 characters'),
+  body('weight')
+    .optional()
+    .isFloat({ min: 0 })
+    .withMessage('Weight must be a positive number')
+];
+
+// Validation middleware for profile update
+const validateProfileUpdate = [
+  param('id').isInt().withMessage('Profile ID must be a valid integer'),
+  ...validateProfileCreation
+];
+
+// Handle validation errors
+const handleValidationErrors = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return sendResponse(res, 400, 'Validation failed', null, errors.array());
+  }
+  next();
+};
+
 // Register
-router.post('/register', validateRegistration, async (req, res) => {
+router.post('/register', authLimiter, validateRegistration, async (req, res) => {
   try {
     validateEnvVars();
     
@@ -47,16 +201,15 @@ router.post('/register', validateRegistration, async (req, res) => {
 
     if (checkError) {
       logger.error('Database check error:', checkError);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (existingUser) {
-      return res.status(409).json({ error: 'User already exists' });
+      return sendResponse(res, 409, 'User already exists');
     }
 
     // Hash password
-    const saltRounds = 12;
-    const password_hash = await bcrypt.hash(password, saltRounds);
+    const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
 
     // Create user
     const { data: user, error } = await supabase
@@ -74,7 +227,7 @@ router.post('/register', validateRegistration, async (req, res) => {
 
     if (error) {
       logger.error('User creation error:', error);
-      return res.status(500).json({ error: 'Failed to create user' });
+      return sendResponse(res, 500, 'Failed to create user');
     }
 
     // Generate JWT
@@ -87,47 +240,63 @@ router.post('/register', validateRegistration, async (req, res) => {
     // Remove password hash from response
     const { password_hash: _, ...userResponse } = user;
 
-    res.status(201).json({
-      message: 'User created successfully',
+    logger.info(`User registered successfully: ${user.id}`);
+
+    return sendResponse(res, 201, 'User created successfully', {
       user: userResponse,
       token
     });
 
   } catch (error) {
     logger.error('Registration error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
 // Login
-router.post('/login', validateLogin, async (req, res) => {
+router.post('/login', authLimiter, validateLogin, async (req, res) => {
   try {
     validateEnvVars();
     
     const { email, password } = req.body;
+    const clientIP = req.ip || req.connection.remoteAddress;
     const supabase = getSupabaseClient();
+
+    // Check account lockout
+    const { isLocked, attempts } = await checkAccountLockout(supabase, email);
+    if (isLocked) {
+      logger.warn(`Account locked due to failed attempts: ${email}`);
+      return sendResponse(res, 429, 'Account temporarily locked due to multiple failed attempts');
+    }
 
     // Find user
     const { data: user, error } = await supabase
       .from('users')
       .select('*')
       .eq('email', email)
+      .is('deleted_at', null)
       .maybeSingle();
 
     if (error) {
       logger.error('Database error during login:', error);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      await recordFailedAttempt(supabase, email, clientIP);
+      return sendResponse(res, 401, 'Invalid credentials');
     }
 
     // Verify password
     const isValidPassword = await bcrypt.compare(password, user.password_hash);
     if (!isValidPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
+      await recordFailedAttempt(supabase, email, clientIP);
+      logger.warn(`Failed login attempt for user: ${email}`);
+      return sendResponse(res, 401, 'Invalid credentials');
     }
+
+    // Clear failed attempts on successful login
+    await clearFailedAttempts(supabase, email);
 
     // Generate JWT
     const token = jwt.sign(
@@ -145,15 +314,16 @@ router.post('/login', validateLogin, async (req, res) => {
     // Remove password hash from response
     const { password_hash: _, ...userResponse } = user;
 
-    res.json({
-      message: 'Login successful',
+    logger.info(`Successful login: ${user.id}`);
+
+    return sendResponse(res, 200, 'Login successful', {
       user: userResponse,
       token
     });
 
   } catch (error) {
     logger.error('Login error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -161,9 +331,9 @@ router.post('/login', validateLogin, async (req, res) => {
 router.get('/me', authenticateToken, async (req, res) => {
   try {
     // Validate user ID
-    if (!req.user.id) {
+    if (!req.user?.id) {
       logger.error('Invalid or missing user id in request');
-      return res.status(401).json({ error: 'Invalid authentication token' });
+      return sendResponse(res, 401, 'Invalid authentication token');
     }
 
     const supabase = getSupabaseClient();
@@ -177,14 +347,14 @@ router.get('/me', authenticateToken, async (req, res) => {
 
     if (error || !user) {
       logger.error(`Get user error for id ${req.user.id}:`, error);
-      return res.status(401).json({ error: 'User not found' });
+      return sendResponse(res, 401, 'User not found');
     }
 
-    res.json({ user });
+    return sendResponse(res, 200, 'User retrieved successfully', { user });
 
   } catch (error) {
-    logger.error(`Get user error for id ${req.user.id || 'unknown'}:`, error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error(`Get user error for id ${req.user?.id || 'unknown'}:`, error);
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -192,13 +362,10 @@ router.get('/me', authenticateToken, async (req, res) => {
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     // Validate user ID
-    if (!req.user.id) {
+    if (!req.user?.id) {
       logger.error('Invalid or missing user id in request');
-      return res.status(401).json({ error: 'Invalid authentication token' });
+      return sendResponse(res, 401, 'Invalid authentication token');
     }
-
-    // Log user ID for debugging
-    logger.info(`Fetching profile for id: ${req.user.id}`);
 
     const supabase = getSupabaseClient();
 
@@ -211,17 +378,14 @@ router.get('/profile', authenticateToken, async (req, res) => {
 
     if (error || !user) {
       logger.error(`Get profile error for id ${req.user.id}:`, error);
-      return res.status(401).json({ error: 'User not found' });
+      return sendResponse(res, 401, 'User not found');
     }
 
-    res.json({
-      message: 'Profile retrieved successfully',
-      user
-    });
+    return sendResponse(res, 200, 'Profile retrieved successfully', { user });
 
   } catch (error) {
-    logger.error(`Get profile error for id ${req.user.id || 'unknown'}:`, error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error(`Get profile error for id ${req.user?.id || 'unknown'}:`, error);
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -229,20 +393,17 @@ router.get('/profile', authenticateToken, async (req, res) => {
 router.patch('/profile', authenticateToken, async (req, res) => {
   try {
     // Validate user ID
-    if (!req.user.id) {
+    if (!req.user?.id) {
       logger.error('Invalid or missing user id in request');
-      return res.status(401).json({ error: 'Invalid authentication token' });
+      return sendResponse(res, 401, 'Invalid authentication token');
     }
-
-    // Log user ID for debugging
-    logger.info(`Updating profile for id: ${req.user.id}`);
 
     const { name, email, phone, profile_image } = req.body;
     const supabase = getSupabaseClient();
 
     // Validate input
     if (!name && !email && !phone && !profile_image) {
-      return res.status(400).json({ error: 'At least one field must be provided for update' });
+      return sendResponse(res, 400, 'At least one field must be provided for update');
     }
 
     // Check if email is already in use by another user
@@ -256,11 +417,11 @@ router.patch('/profile', authenticateToken, async (req, res) => {
 
       if (checkError) {
         logger.error(`Email check error for id ${req.user.id}:`, checkError);
-        return res.status(500).json({ error: 'Database error' });
+        return sendResponse(res, 500, 'Database error');
       }
 
       if (existingUser) {
-        return res.status(409).json({ error: 'Email already in use' });
+        return sendResponse(res, 409, 'Email already in use');
       }
     }
 
@@ -281,7 +442,7 @@ router.patch('/profile', authenticateToken, async (req, res) => {
         updateData.profile_image = uploadResult.secure_url;
       } catch (uploadError) {
         logger.error(`Cloudinary upload error for id ${req.user.id}:`, uploadError);
-        return res.status(500).json({ error: 'Failed to upload profile image' });
+        return sendResponse(res, 500, 'Failed to upload profile image');
       }
     }
 
@@ -297,17 +458,16 @@ router.patch('/profile', authenticateToken, async (req, res) => {
 
     if (error) {
       logger.error(`Profile update error for id ${req.user.id}:`, error);
-      return res.status(500).json({ error: 'Failed to update profile' });
+      return sendResponse(res, 500, 'Failed to update profile');
     }
 
-    res.json({
-      message: 'Profile updated successfully',
-      user: updatedUser
-    });
+    logger.info(`Profile updated for user: ${req.user.id}`);
+
+    return sendResponse(res, 200, 'Profile updated successfully', { user: updatedUser });
 
   } catch (error) {
-    logger.error(`Profile update error for id ${req.user.id || 'unknown'}:`, error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error(`Profile update error for id ${req.user?.id || 'unknown'}:`, error);
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -315,9 +475,9 @@ router.patch('/profile', authenticateToken, async (req, res) => {
 router.delete('/me', authenticateToken, async (req, res) => {
   try {
     // Validate user ID
-    if (!req.user.id) {
+    if (!req.user?.id) {
       logger.error('Invalid or missing user id in request');
-      return res.status(401).json({ error: 'Invalid authentication token' });
+      return sendResponse(res, 401, 'Invalid authentication token');
     }
 
     const supabase = getSupabaseClient();
@@ -334,26 +494,26 @@ router.delete('/me', authenticateToken, async (req, res) => {
 
     if (error) {
       logger.error(`User deletion error for id ${req.user.id}:`, error);
-      return res.status(500).json({ error: 'Failed to delete user data' });
+      return sendResponse(res, 500, 'Failed to delete user data');
     }
 
     // Log deletion for audit
     logger.info(`User ${req.user.id} requested data deletion`);
 
-    res.json({ message: 'User data deleted successfully' });
+    return sendResponse(res, 200, 'User data deleted successfully');
   } catch (error) {
-    logger.error(`User deletion error for id ${req.user.id || 'unknown'}:`, error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error(`User deletion error for id ${req.user?.id || 'unknown'}:`, error);
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
 // Password Reset Request
-router.post('/password-reset', async (req, res) => {
+router.post('/password-reset', resetLimiter, async (req, res) => {
   try {
     const { email } = req.body;
 
     if (!email) {
-      return res.status(400).json({ error: 'Email is required' });
+      return sendResponse(res, 400, 'Email is required');
     }
 
     const supabase = getSupabaseClient();
@@ -367,16 +527,16 @@ router.post('/password-reset', async (req, res) => {
 
     if (error) {
       logger.error('Database error during password reset:', error);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     // Always return success to prevent email enumeration
     if (!user) {
-      return res.json({ message: 'If an account exists, password reset link has been sent' });
+      return sendResponse(res, 200, 'If an account exists, password reset link has been sent');
     }
 
-    const resetToken = uuidv4();
-    const expiresAt = new Date(Date.now() + 3600 * 1000); // 1 hour expiry
+    const resetToken = generateSecureToken();
+    const expiresAt = new Date(Date.now() + RESET_TOKEN_EXPIRY_HOURS * 60 * 60 * 1000);
 
     // Delete any existing reset tokens for this user
     await supabase
@@ -395,13 +555,13 @@ router.post('/password-reset', async (req, res) => {
 
     if (insertError) {
       logger.error('Error creating password reset token:', insertError);
-      return res.status(500).json({ error: 'Failed to create reset token' });
+      return sendResponse(res, 500, 'Failed to create reset token');
     }
 
     // Send email (only if environment variables are set)
     if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
       try {
-        const transporter = nodemailer.createTransport({
+        const transporter = nodemailer.createTransporter({
           service: 'gmail',
           auth: {
             user: process.env.EMAIL_USER,
@@ -416,34 +576,36 @@ router.post('/password-reset', async (req, res) => {
             <h2>Password Reset Request</h2>
             <p>Click the link below to reset your password:</p>
             <a href="${process.env.FRONTEND_URL}/reset-password/${resetToken}">Reset Password</a>
-            <p>This link expires in 1 hour.</p>
+            <p>This link expires in ${RESET_TOKEN_EXPIRY_HOURS} hour(s).</p>
             <p>If you didn't request this, please ignore this email.</p>
           `,
         });
+
+        logger.info(`Password reset email sent to: ${email}`);
       } catch (emailError) {
         logger.error('Email sending error:', emailError);
         // Don't fail the request if email fails
       }
     }
 
-    res.json({ message: 'If an account exists, password reset link has been sent' });
+    return sendResponse(res, 200, 'If an account exists, password reset link has been sent');
   } catch (error) {
     logger.error('Password reset error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
 // Verify Password Reset Token
-router.post('/password-reset/verify', async (req, res) => {
+router.post('/password-reset/verify', authLimiter, async (req, res) => {
   try {
     const { token, newPassword } = req.body;
 
     if (!token || !newPassword) {
-      return res.status(400).json({ error: 'Token and new password are required' });
+      return sendResponse(res, 400, 'Token and new password are required');
     }
 
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters long' });
+    if (newPassword.length < PASSWORD_MIN_LENGTH) {
+      return sendResponse(res, 400, `Password must be at least ${PASSWORD_MIN_LENGTH} characters long`);
     }
 
     const supabase = getSupabaseClient();
@@ -456,32 +618,34 @@ router.post('/password-reset/verify', async (req, res) => {
 
     if (error) {
       logger.error('Database error during password reset verification:', error);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (!reset || new Date(reset.expires_at) < new Date()) {
-      return res.status(400).json({ error: 'Invalid or expired token' });
+      return sendResponse(res, 400, 'Invalid or expired token');
     }
 
-    const password_hash = await bcrypt.hash(newPassword, 12);
+    const password_hash = await bcrypt.hash(newPassword, SALT_ROUNDS);
     
     const { error: updateError } = await supabase
       .from('users')
       .update({ password_hash, updated_at: new Date().toISOString() })
       .eq('id', reset.user_id);
 
-    if (error) {
+    if (updateError) {
       logger.error('Error updating password:', updateError);
-      return res.status(500).json({ error: 'Failed to update password' });
+      return sendResponse(res, 500, 'Failed to update password');
     }
 
     // Delete the used reset token
     await supabase.from('password_resets').delete().eq('token', token);
 
-    res.json({ message: 'Password reset successfully' });
+    logger.info(`Password reset successful for user: ${reset.user_id}`);
+
+    return sendResponse(res, 200, 'Password reset successfully');
   } catch (error) {
     logger.error('Password reset verification error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
@@ -491,86 +655,104 @@ router.post('/enable-2fa', authenticateToken, async (req, res) => {
     const { phone_number } = req.body;
 
     if (!phone_number) {
-      return res.status(400).json({ error: 'Phone number is required' });
+      return sendResponse(res, 400, 'Phone number is required');
+    }
+
+    if (!PHONE_REGEX.test(phone_number)) {
+      return sendResponse(res, 400, 'Invalid phone number format');
     }
 
     if (!process.env.TWILIO_VERIFY_SID) {
-      return res.status(500).json({ error: '2FA service not configured' });
+      return sendResponse(res, 500, '2FA service not configured');
     }
 
     const supabase = getSupabaseClient();
 
-    const verification = await client.verify.v2
-      .services(process.env.TWILIO_VERIFY_SID)
-      .verifications.create({ to: phone_number, channel: 'sms' });
+    try {
+      const verification = await client.verify.v2
+        .services(process.env.TWILIO_VERIFY_SID)
+        .verifications.create({ 
+          to: phone_number, 
+          channel: 'sms',
+          customFriendlyName: 'Healthcare App 2FA Setup'
+        });
 
-    const { error } = await supabase
-      .from('users')
-      .update({ phone_number, two_factor_enabled: true })
-      .eq('id', req.user.id);
+      const { error } = await supabase
+        .from('users')
+        .update({ phone_number, two_factor_enabled: true })
+        .eq('id', req.user.id);
 
-    if (error) {
-      logger.error('Error enabling 2FA:', error);
-      return res.status(500).json({ error: 'Failed to enable 2FA' });
+      if (error) {
+        logger.error('Error enabling 2FA:', error);
+        return sendResponse(res, 500, 'Failed to enable 2FA');
+      }
+
+      logger.info(`2FA enabled for user: ${req.user.id}`);
+
+      return sendResponse(res, 200, '2FA enabled, verification code sent');
+    } catch (twilioError) {
+      logger.error('Twilio 2FA error:', twilioError);
+      return sendResponse(res, 500, 'Failed to send verification code');
     }
-
-    res.json({ message: '2FA enabled, verification code sent' });
   } catch (error) {
     logger.error('Enable 2FA error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
 // Verify 2FA Code
-router.post('/verify-2fa', async (req, res) => {
+router.post('/verify-2fa', otpLimiter, async (req, res) => {
   try {
     const { phone_number, code } = req.body;
 
     if (!phone_number || !code) {
-      return res.status(400).json({ error: 'Phone number and code are required' });
+      return sendResponse(res, 400, 'Phone number and code are required');
     }
 
     if (!process.env.TWILIO_VERIFY_SID) {
-      return res.status(500).json({ error: '2FA service not configured' });
+      return sendResponse(res, 500, '2FA service not configured');
     }
 
-    const verificationCheck = await client.verify.v2
-      .services(process.env.TWILIO_VERIFY_SID)
-      .verificationChecks.create({ to: phone_number, code });
+    try {
+      const verificationCheck = await client.verify.v2
+        .services(process.env.TWILIO_VERIFY_SID)
+        .verificationChecks.create({ to: phone_number, code });
 
-    if (verificationCheck.status !== 'approved') {
-      return res.status(400).json({ error: 'Invalid verification code' });
+      if (verificationCheck.status !== 'approved') {
+        return sendResponse(res, 400, 'Invalid verification code');
+      }
+
+      logger.info(`2FA verification successful for phone: ${phone_number}`);
+
+      return sendResponse(res, 200, '2FA verification successful');
+    } catch (twilioError) {
+      logger.error('Twilio verify 2FA error:', twilioError);
+      return sendResponse(res, 400, 'Invalid verification code');
     }
-
-    res.json({ message: '2FA verification successful' });
   } catch (error) {
     logger.error('Verify 2FA error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
-
-
-
-// POST /api/auth/phone-login
-router.post('/phone-login', async (req, res) => {
+// Phone Login - Step 1: Send OTP
+router.post('/phone-login', otpLimiter, async (req, res) => {
   try {
     const { phone_number, role } = req.body;
 
     // Validate phone number
     if (!phone_number) {
-      return res.status(400).json({ error: 'Phone number is required' });
+      return sendResponse(res, 400, 'Phone number is required');
     }
 
-    const phoneRegex = /^\+?[1-9]\d{1,14}$/;
-    if (!phoneRegex.test(phone_number)) {
-      return res.status(400).json({ error: 'Invalid phone number format' });
+    if (!PHONE_REGEX.test(phone_number)) {
+      return sendResponse(res, 400, 'Invalid phone number format');
     }
 
     // Check Twilio env
     if (!process.env.TWILIO_VERIFY_SID || !process.env.TWILIO_SID || !process.env.TWILIO_AUTH_TOKEN) {
       logger.error('Twilio credentials missing');
-      return res.status(500).json({ error: 'Phone authentication service not available' });
+      return sendResponse(res, 500, 'Phone authentication service not available');
     }
 
     const supabase = getSupabaseClient();
@@ -585,16 +767,16 @@ router.post('/phone-login', async (req, res) => {
 
     if (error) {
       logger.error('Supabase user lookup error:', error);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (!user) {
-      return res.status(404).json({ error: 'No account found with this phone number' });
+      return sendResponse(res, 404, 'No account found with this phone number');
     }
 
     // Optional role check
     if (role && user.role !== role) {
-      return res.status(401).json({ error: 'Invalid credentials for this role' });
+      return sendResponse(res, 401, 'Invalid credentials for this role');
     }
 
     // Send OTP
@@ -611,7 +793,7 @@ router.post('/phone-login', async (req, res) => {
 
       // Generate session token
       const sessionToken = uuidv4();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 min expiry
+      const expiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
 
       // Clean up old sessions
       await supabase
@@ -632,13 +814,12 @@ router.post('/phone-login', async (req, res) => {
 
       if (sessionError) {
         logger.error('Failed to create session:', sessionError);
-        return res.status(500).json({ error: 'Login session creation failed' });
+        return sendResponse(res, 500, 'Login session creation failed');
       }
 
-      return res.status(200).json({
-        message: 'OTP sent successfully',
+      return sendResponse(res, 200, 'OTP sent successfully', {
         sessionToken,
-        expiresIn: 600, // seconds
+        expiresIn: OTP_EXPIRY_MINUTES * 60, // seconds
         phone_number: phone_number.replace(/(\+\d{3})(\d{3})(\d{4})/, '$1****$3') // Masked
       });
 
@@ -646,33 +827,33 @@ router.post('/phone-login', async (req, res) => {
       logger.error('Twilio Verify error:', twilioError);
 
       if (twilioError.code === 60200) {
-        return res.status(400).json({ error: 'Invalid phone number' });
+        return sendResponse(res, 400, 'Invalid phone number');
       } else if (twilioError.code === 60203) {
-        return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+        return sendResponse(res, 429, 'Too many attempts. Try again later.');
       }
 
-      return res.status(500).json({ error: 'Failed to send OTP. Please try again.' });
+      return sendResponse(res, 500, 'Failed to send OTP. Please try again.');
     }
 
   } catch (err) {
     logger.error('Unhandled phone login error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
-// Verify Phone OTP and Complete Login
-router.post('/verify-phone-otp', async (req, res) => {
+// Phone Login - Step 2: Verify OTP and Complete Login
+router.post('/verify-phone-otp', otpLimiter, async (req, res) => {
   try {
     const { sessionToken, otpCode } = req.body;
 
     // Validate input
     if (!sessionToken || !otpCode) {
-      return res.status(400).json({ error: 'Session token and OTP code are required' });
+      return sendResponse(res, 400, 'Session token and OTP code are required');
     }
 
     // Validate OTP code format
     if (!/^\d{6}$/.test(otpCode)) {
-      return res.status(400).json({ error: 'Invalid OTP format. Please enter a 6-digit code.' });
+      return sendResponse(res, 400, 'Invalid OTP format. Please enter a 6-digit code.');
     }
 
     const supabase = getSupabaseClient();
@@ -686,11 +867,11 @@ router.post('/verify-phone-otp', async (req, res) => {
 
     if (sessionError) {
       logger.error('Database error during OTP verification:', sessionError);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (!session) {
-      return res.status(400).json({ error: 'Invalid or expired session' });
+      return sendResponse(res, 400, 'Invalid or expired session');
     }
 
     if (new Date(session.expires_at) < new Date()) {
@@ -700,11 +881,11 @@ router.post('/verify-phone-otp', async (req, res) => {
         .delete()
         .eq('session_token', sessionToken);
       
-      return res.status(400).json({ error: 'Session expired. Please request a new OTP.' });
+      return sendResponse(res, 400, 'Session expired. Please request a new OTP.');
     }
 
     if (session.verified) {
-      return res.status(400).json({ error: 'OTP already verified. Please login again.' });
+      return sendResponse(res, 400, 'OTP already verified. Please login again.');
     }
 
     try {
@@ -717,7 +898,7 @@ router.post('/verify-phone-otp', async (req, res) => {
         });
 
       if (verificationCheck.status !== 'approved') {
-        return res.status(400).json({ error: 'Invalid OTP code. Please try again.' });
+        return sendResponse(res, 400, 'Invalid OTP code. Please try again.');
       }
 
       // Get user data
@@ -730,7 +911,7 @@ router.post('/verify-phone-otp', async (req, res) => {
 
       if (userError || !user) {
         logger.error('User not found during OTP verification:', userError);
-        return res.status(401).json({ error: 'User not found' });
+        return sendResponse(res, 401, 'User not found');
       }
 
       // Mark session as verified and clean up
@@ -754,8 +935,7 @@ router.post('/verify-phone-otp', async (req, res) => {
 
       logger.info(`Phone login successful for user ${user.id}`);
 
-      res.json({
-        message: 'Phone login successful',
+      return sendResponse(res, 200, 'Phone login successful', {
         user,
         token
       });
@@ -764,25 +944,25 @@ router.post('/verify-phone-otp', async (req, res) => {
       logger.error('Twilio verification error:', twilioError);
       
       if (twilioError.code === 60202) {
-        return res.status(429).json({ error: 'Max verification attempts reached. Please request a new OTP.' });
+        return sendResponse(res, 429, 'Max verification attempts reached. Please request a new OTP.');
       }
       
-      return res.status(400).json({ error: 'OTP verification failed. Please try again.' });
+      return sendResponse(res, 400, 'OTP verification failed. Please try again.');
     }
 
   } catch (error) {
     logger.error('OTP verification error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
 
 // Resend Phone OTP
-router.post('/resend-phone-otp', async (req, res) => {
+router.post('/resend-phone-otp', otpLimiter, async (req, res) => {
   try {
     const { sessionToken } = req.body;
 
     if (!sessionToken) {
-      return res.status(400).json({ error: 'Session token is required' });
+      return sendResponse(res, 400, 'Session token is required');
     }
 
     const supabase = getSupabaseClient();
@@ -796,15 +976,15 @@ router.post('/resend-phone-otp', async (req, res) => {
 
     if (sessionError) {
       logger.error('Database error during OTP resend:', sessionError);
-      return res.status(500).json({ error: 'Database error' });
+      return sendResponse(res, 500, 'Database error');
     }
 
     if (!session) {
-      return res.status(400).json({ error: 'Invalid session' });
+      return sendResponse(res, 400, 'Invalid session');
     }
 
     if (session.verified) {
-      return res.status(400).json({ error: 'Session already verified' });
+      return sendResponse(res, 400, 'Session already verified');
     }
 
     try {
@@ -818,7 +998,7 @@ router.post('/resend-phone-otp', async (req, res) => {
         });
 
       // Update session expiry
-      const newExpiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+      const newExpiresAt = new Date(Date.now() + OTP_EXPIRY_MINUTES * 60 * 1000);
       await supabase
         .from('phone_login_sessions')
         .update({ expires_at: newExpiresAt.toISOString() })
@@ -826,24 +1006,360 @@ router.post('/resend-phone-otp', async (req, res) => {
 
       logger.info(`OTP resent to ${session.phone_number}`);
 
-      res.json({
-        message: 'OTP resent successfully',
-        expiresIn: 600
+      return sendResponse(res, 200, 'OTP resent successfully', {
+        expiresIn: OTP_EXPIRY_MINUTES * 60
       });
 
     } catch (twilioError) {
       logger.error('Twilio resend error:', twilioError);
       
       if (twilioError.code === 60203) {
-        return res.status(429).json({ error: 'Too many attempts. Please wait before requesting another OTP.' });
+        return sendResponse(res, 429, 'Too many attempts. Please wait before requesting another OTP.');
       }
       
-      return res.status(500).json({ error: 'Failed to resend OTP. Please try again.' });
+      return sendResponse(res, 500, 'Failed to resend OTP. Please try again.');
     }
 
   } catch (error) {
     logger.error('OTP resend error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    return sendResponse(res, 500, 'Internal server error');
   }
 });
+
+// POST - Create user profile
+router.post(
+  '/user-profile',
+  authenticateToken,
+  validateProfileCreation,
+  handleValidationErrors,
+  async (req, res) => {
+    try {
+      const { age, bmi, medical_conditions, previous_pregnancies, gestational_week, weight } = req.body;
+      const user_id = req.user?.id;
+
+   
+      const supabase = getSupabaseClient();
+
+      // Check if profile already exists for this user
+      const { data: existingProfile, error: checkError } = await supabase
+        .from('users_profile')
+        .select('id')
+        .eq('user_id', user_id)
+        .maybeSingle();
+
+      if (checkError) {
+        logger.error('Database check error:', checkError);
+        return sendResponse(res, 500, 'Database error');
+      }
+
+      if (existingProfile) {
+        return sendResponse(res, 409, 'Profile already exists for this user');
+      }
+
+      // Create profile
+      const { data: profile, error } = await supabase
+        .from('users_profile')
+        .insert([{
+          user_id,
+          age,
+          bmi,
+          medical_conditions,
+          previous_pregnancies,
+          gestational_week,
+          weight
+        }])
+        .select()
+        .single();
+
+      if (error) {
+        logger.error('Profile creation error:', error);
+        return sendResponse(res, 500, 'Failed to create profile');
+      }
+
+      logger.info(`User profile created for user: ${user_id}`);
+
+      return sendResponse(res, 201, 'Profile created successfully', { profile });
+
+    } catch (error) {
+      logger.error('Profile creation error:', error);
+      return sendResponse(res, 500, 'Internal server error');
+    }
+  }
+);
+
+
+// GET - Get all user profiles (admin only or with pagination)
+router.get('/user-profiles', authenticateToken, async (req, res) => {
+  try {
+    const { page = 1, limit = 10 } = req.query;
+    const supabase = getSupabaseClient();
+
+    // Validate pagination parameters
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    
+    if (pageNum < 1 || limitNum < 1 || limitNum > 100) {
+      return sendResponse(res, 400, 'Invalid pagination parameters');
+    }
+
+    // Calculate offset for pagination
+    const offset = (pageNum - 1) * limitNum;
+
+    const { data: profiles, error, count } = await supabase
+      .from('users_profile')
+      .select('*, users(email, full_name)', { count: 'exact' })
+      .range(offset, offset + limitNum - 1)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      logger.error('Profiles fetch error:', error);
+      return sendResponse(res, 500, 'Failed to fetch profiles');
+    }
+
+    return sendResponse(res, 200, 'Profiles retrieved successfully', {
+      profiles,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: count,
+        totalPages: Math.ceil(count / limitNum)
+      }
+    });
+
+  } catch (error) {
+    logger.error('Profiles fetch error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// GET - Get current user's profile
+router.get('/user-profile/me', authenticateToken, async (req, res) => {
+  try {
+    const user_id = req.user.id;
+    const supabase = getSupabaseClient();
+
+    const { data: profile, error } = await supabase
+      .from('users_profile')
+      .select('*')
+      .eq('user_id', user_id)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('Profile fetch error:', error);
+      return sendResponse(res, 500, 'Failed to fetch profile');
+    }
+
+    if (!profile) {
+      return sendResponse(res, 404, 'Profile not found');
+    }
+
+    return sendResponse(res, 200, 'Profile retrieved successfully', { profile });
+
+  } catch (error) {
+    logger.error('Profile fetch error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// GET - Get specific user profile by ID
+router.get('/user-profile/:id', authenticateToken, param('id').isInt(), handleValidationErrors, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const supabase = getSupabaseClient();
+
+    const { data: profile, error } = await supabase
+      .from('users_profile')
+      .select('*, users(email, full_name)')
+      .eq('id', profileId)
+      .maybeSingle();
+
+    if (error) {
+      logger.error('Profile fetch error:', error);
+      return sendResponse(res, 500, 'Failed to fetch profile');
+    }
+
+    if (!profile) {
+      return sendResponse(res, 404, 'Profile not found');
+    }
+
+    // Authorization check - users can only view their own profile unless they're admin
+    if (profile.user_id !== req.user.id && req.user.role !== 'admin') {
+      return sendResponse(res, 403, 'Access denied');
+    }
+
+    return sendResponse(res, 200, 'Profile retrieved successfully', { profile });
+
+  } catch (error) {
+    logger.error('Profile fetch error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// PUT - Update user profile
+router.put('/user-profile/:id', authenticateToken, validateProfileUpdate, handleValidationErrors, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const { age, bmi, medical_conditions, previous_pregnancies, gestational_week, weight } = req.body;
+    const supabase = getSupabaseClient();
+
+    // Check if profile exists and belongs to user (or user is admin)
+    const { data: existingProfile, error: checkError } = await supabase
+      .from('users_profile')
+      .select('user_id')
+      .eq('id', profileId)
+      .maybeSingle();
+
+    if (checkError) {
+      logger.error('Database check error:', checkError);
+      return sendResponse(res, 500, 'Database error');
+    }
+
+    if (!existingProfile) {
+      return sendResponse(res, 404, 'Profile not found');
+    }
+
+    // Authorization check
+    if (existingProfile.user_id !== req.user.id && req.user.role !== 'admin') {
+      return sendResponse(res, 403, 'Access denied');
+    }
+
+    // Prepare update object (only include provided fields)
+    const updateData = {};
+    if (age !== undefined) updateData.age = age;
+    if (bmi !== undefined) updateData.bmi = bmi;
+    if (medical_conditions !== undefined) updateData.medical_conditions = medical_conditions;
+    if (previous_pregnancies !== undefined) updateData.previous_pregnancies = previous_pregnancies;
+    if (gestational_week !== undefined) updateData.gestational_week = gestational_week;
+    if (weight !== undefined) updateData.weight = weight;
+    updateData.updated_at = new Date().toISOString();
+
+    if (Object.keys(updateData).length === 1) { // only updated_at
+      return sendResponse(res, 400, 'No valid fields provided for update');
+    }
+
+    // Update profile
+    const { data: profile, error } = await supabase
+      .from('users_profile')
+      .update(updateData)
+      .eq('id', profileId)
+      .select()
+      .single();
+
+    if (error) {
+      logger.error('Profile update error:', error);
+      return sendResponse(res, 500, 'Failed to update profile');
+    }
+
+    logger.info(`User profile updated: ${profileId}`);
+
+    return sendResponse(res, 200, 'Profile updated successfully', { profile });
+
+  } catch (error) {
+    logger.error('Profile update error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// DELETE - Delete user profile
+router.delete('/user-profile/:id', authenticateToken, param('id').isInt(), handleValidationErrors, async (req, res) => {
+  try {
+    const profileId = req.params.id;
+    const supabase = getSupabaseClient();
+
+    // Check if profile exists and belongs to user (or user is admin)
+    const { data: existingProfile, error: checkError } = await supabase
+      .from('users_profile')
+      .select('user_id')
+      .eq('id', profileId)
+      .maybeSingle();
+
+    if (checkError) {
+      logger.error('Database check error:', checkError);
+      return sendResponse(res, 500, 'Database error');
+    }
+
+    if (!existingProfile) {
+      return sendResponse(res, 404, 'Profile not found');
+    }
+
+    // Authorization check
+    if (existingProfile.user_id !== req.user.id && req.user.role !== 'admin') {
+      return sendResponse(res, 403, 'Access denied');
+    }
+
+    // Delete profile
+    const { error } = await supabase
+      .from('users_profile')
+      .delete()
+      .eq('id', profileId);
+
+    if (error) {
+      logger.error('Profile deletion error:', error);
+      return sendResponse(res, 500, 'Failed to delete profile');
+    }
+
+    logger.info(`User profile deleted: ${profileId}`);
+
+    return sendResponse(res, 200, 'Profile deleted successfully');
+
+  } catch (error) {
+    logger.error('Profile deletion error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// Health check endpoint
+router.get('/health', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    
+    // Simple database connectivity test
+    const { error } = await supabase
+      .from('users')
+      .select('id')
+      .limit(1);
+    
+    if (error) {
+      logger.error('Health check database error:', error);
+      return sendResponse(res, 503, 'Database connection failed');
+    }
+
+    return sendResponse(res, 200, 'Service is healthy', {
+      timestamp: new Date().toISOString(),
+      database: 'connected',
+      services: {
+        twilio: !!process.env.TWILIO_SID,
+        cloudinary: !!process.env.CLOUDINARY_CLOUD_NAME,
+        email: !!(process.env.EMAIL_USER && process.env.EMAIL_PASS)
+      }
+    });
+  } catch (error) {
+    logger.error('Health check error:', error);
+    return sendResponse(res, 500, 'Service unhealthy');
+  }
+});
+
+// Logout endpoint (for token blacklisting if implemented)
+router.post('/logout', authenticateToken, async (req, res) => {
+  try {
+    // In a production environment, you might want to:
+    // 1. Add token to blacklist
+    // 2. Clear any server-side sessions
+    // 3. Log the logout event
+    
+    logger.info(`User logged out: ${req.user.id}`);
+    
+    return sendResponse(res, 200, 'Logged out successfully');
+  } catch (error) {
+    logger.error('Logout error:', error);
+    return sendResponse(res, 500, 'Internal server error');
+  }
+});
+
+// Error handling middleware
+router.use((error, req, res, next) => {
+  logger.error('Unhandled route error:', error);
+  return sendResponse(res, 500, 'Internal server error');
+});
+
 module.exports = router;

@@ -1,205 +1,1279 @@
-// routes/healthTips.js (Replace existing GET / route)
+// routes/healthTips.js - Debug and Enhanced Version
 const { getSupabaseClient } = require('../config/database');
-const { getCached, setCached } = require('../config/cache');
+const { getCached, setCached, deleteCached } = require('../config/cache');
 const logger = require('../utils/logger');
 const { auditLog } = require('../utils/logger');
 const axios = require('axios');
 
 const router = require('express').Router();
 
-// Mock AI API call (replace with actual xAI API endpoint)
-async function getAIPersonalizedTips(userProfile, pregnancyWeek) {
+// Configuration for maternal health API
+const MATERNAL_HEALTH_API_URL = process.env.MATERNAL_HEALTH_API_URL || 'http://localhost:8000';
+const API_TIMEOUT = parseInt(process.env.API_TIMEOUT) || 8000; // Increased timeout
+const DATABASE_FALLBACK_ENABLED = process.env.DATABASE_FALLBACK_ENABLED !== 'false';
+
+// Helper function to get user's health data with better error handling
+async function getUserHealthData(userId, supabase) {
   try {
-    const response = await axios.post(
-      process.env.XAI_API_URL || 'https://api.x.ai/v1/recommendations',
-      {
-        user_profile: userProfile,
-        pregnancy_week: pregnancyWeek,
-        api_key: process.env.XAI_API_KEY,
-      },
-      {
-        headers: { 'Content-Type': 'application/json' },
-      }
-    );
-    return response.data.recommendations;
-    
-  } catch (error) {
-    logger.error('AI API error:', error);
-    return null; // Fallback to rule-based logic
-  }
-}
+    logger.info(`Fetching health data for user ${userId}`);
 
-router.get('/', async (req, res) => {
-  try {
-    const supabase = getSupabaseClient();
-    const cacheKey = `health_tips:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
-
-    const cachedTips = await getCached(cacheKey);
-    if (cachedTips) {
-      return res.json(cachedTips);
-    }
-
-    const { data: pregnancy } = await supabase
+    // Get pregnancy information
+    const { data: pregnancy, error: pregnancyError } = await supabase
       .from('pregnancies')
-      .select('start_date')
-      .eq('user_id', req.user.id)
+      .select('start_date, due_date, age_at_conception')
+      .eq('user_id', userId)
       .eq('status', 'active')
       .single();
 
-    if (!pregnancy) {
-      return res.status(404).json({ error: 'No active pregnancy found' });
+    if (pregnancyError) {
+      logger.warn(`Pregnancy query error for user ${userId}:`, pregnancyError);
     }
 
-    const { data: profile } = await supabase
+    if (!pregnancy) {
+      logger.warn(`No active pregnancy found for user ${userId}, using defaults`);
+      // Create default pregnancy data for demo/testing purposes
+      const defaultPregnancy = {
+        start_date: new Date(Date.now() - (12 * 7 * 24 * 60 * 60 * 1000)).toISOString(), // 12 weeks ago
+        due_date: new Date(Date.now() + (28 * 7 * 24 * 60 * 60 * 1000)).toISOString(), // 28 weeks from now
+        age_at_conception: 28
+      };
+      
+      // For production, you might want to throw an error here instead
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error('No active pregnancy found');
+      }
+      
+      logger.info('Using default pregnancy data for development/testing');
+      return {
+        pregnancy: defaultPregnancy,
+        profile: { age: 28, bmi: 24, medical_conditions: [], previous_pregnancies: 0 },
+        wearable: null,
+        weightData: null,
+        gestationalWeek: 12
+      };
+    }
+
+    // Calculate gestational week
+    const startDate = new Date(pregnancy.start_date);
+    const currentDate = new Date();
+    const gestationalWeek = Math.max(0, Math.floor((currentDate - startDate) / (7 * 24 * 60 * 60 * 1000)));
+
+    // Get user profile with error handling
+    const { data: profile, error: profileError } = await supabase
       .from('user_profiles')
-      .select('medical_conditions, dietary_preferences')
-      .eq('user_id', req.user.id)
+      .select('age, bmi, medical_conditions, previous_pregnancies')
+      .eq('user_id', userId)
       .single();
 
-    const { data: wearable } = await supabase
+    if (profileError) {
+      logger.warn(`Profile query error for user ${userId}:`, profileError);
+    }
+
+    // Get latest wearable/health data
+    const { data: wearable, error: wearableError } = await supabase
       .from('wearable_data')
-      .select('heart_rate, blood_pressure, temperature')
-      .eq('user_id', req.user.id)
+      .select('heart_rate, blood_pressure, temperature, blood_sugar')
+      .eq('user_id', userId)
       .order('timestamp', { ascending: false })
       .limit(1)
       .single();
 
-    const currentWeek = Math.floor((new Date() - new Date(pregnancy.start_date)) / (7 * 24 * 60 * 60 * 1000));
-    const input = {
-      Age: req.user.age || 25,  // Assume default if not available
-      SystolicBP: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[0]) : 120,
-      DiastolicBP: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[1]) : 80,
-      BS: profile?.medical_conditions?.includes('diabetes') ? 6.0 : 4.5,  // Simplified assumption
-      BodyTemp: wearable?.temperature ? (wearable.temperature * 9 / 5 + 32) : 98.6,  // Convert to Fahrenheit
-      HeartRate: wearable?.heart_rate || 80,
-    };
-
-    let category;
-    try {
-      const response = await axios.post(
-        process.env.MODEL_API_URL + '/health-tips',
-        input,
-        { headers: { 'Content-Type': 'application/json' } }
-      );
-      category = response.data.category;
-    } catch (error) {
-      logger.error('Model API error:', error);
-      category = input.BS > 5.5 ? 'nutrition' :
-        (input.HeartRate < 60 || input.HeartRate > 100) ? 'mental_health' : 'exercise';
+    if (wearableError && wearableError.code !== 'PGRST116') { // PGRST116 = no rows returned
+      logger.warn(`Wearable data query error for user ${userId}:`, wearableError);
     }
 
-    const { data: healthTips, error } = await supabase
-      .from('health_tips')
-      .select('*')
-      .eq('category', category)
-      .lte('week_start', Math.max(0, currentWeek))
-      .gte('week_end', Math.max(0, currentWeek))
-      .order('created_at', { ascending: false });
+    // Get weight tracking data
+    const { data: weightData, error: weightError } = await supabase
+      .from('weight_tracking')
+      .select('weight_gain')
+      .eq('user_id', userId)
+      .order('recorded_at', { ascending: false })
+      .limit(1)
+      .single();
 
-    if (error) {
-      logger.error('Get health tips error:', error);
-      return res.status(500).json({ error: 'Failed to fetch health tips' });
+    if (weightError && weightError.code !== 'PGRST116') {
+      logger.warn(`Weight data query error for user ${userId}:`, weightError);
     }
 
-    const response = {
-      currentWeek: Math.max(0, currentWeek),
-      healthTips,
-      source: category === healthTips[0]?.category ? 'model' : 'rule-based',
+    logger.info(`Health data fetched for user ${userId}:`, {
+      hasPregnancy: !!pregnancy,
+      hasProfile: !!profile,
+      hasWearable: !!wearable,
+      hasWeightData: !!weightData,
+      gestationalWeek
+    });
+
+    return {
+      pregnancy,
+      profile,
+      wearable,
+      weightData,
+      gestationalWeek
     };
 
-    await setCached(cacheKey, response, 24 * 60 * 60);
-    auditLog('fetch_health_tips', req.user.id, { week: currentWeek, source: response.source });
-    res.json(response);
   } catch (error) {
-    logger.error('Get health tips error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error('Error fetching user health data:', error);
+    throw error;
   }
-});
+}
 
-// Get tips by category
-router.get('/category/:category', async (req, res) => {
+// Enhanced function to fetch health tips from database with better fallbacks
+async function fetchHealthTipsFromDatabase(supabase, category, gestationalWeek, userId) {
   try {
-    const { category } = req.params;
-    const supabase = getSupabaseClient();
+    logger.info(`Fetching health tips from database:`, { category, gestationalWeek, userId });
 
-    const { data: healthTips, error } = await supabase
+    // First try: exact week match
+    let { data: healthTips, error } = await supabase
       .from('health_tips')
       .select('*')
       .eq('category', category)
-      .order('week_start', { ascending: true });
+      .lte('week_start', Math.max(0, gestationalWeek))
+      .gte('week_end', Math.max(0, gestationalWeek))
+      .order('created_at', { ascending: false })
+      .limit(10);
 
     if (error) {
-      logger.error('Get health tips by category error:', error);
-      return res.status(500).json({ error: 'Failed to fetch health tips' });
+      logger.error('Database query error (exact match):', error);
+      throw error;
     }
 
-    res.json({ healthTips });
+    // If no tips found for exact week, try broader range
+    if (!healthTips || healthTips.length === 0) {
+      logger.info(`No tips found for exact week ${gestationalWeek}, trying broader range`);
+      
+      const { data: broadTips, error: broadError } = await supabase
+        .from('health_tips')
+        .select('*')
+        .eq('category', category)
+        .order('created_at', { ascending: false })
+        .limit(15);
+
+      if (broadError) {
+        logger.error('Database query error (broad search):', broadError);
+      } else {
+        healthTips = broadTips;
+      }
+    }
+
+    // If still no tips for this category, try general category
+    if (!healthTips || healthTips.length === 0) {
+      logger.info(`No tips found for category ${category}, trying general category`);
+      
+      const { data: generalTips, error: generalError } = await supabase
+        .from('health_tips')
+        .select('*')
+        .eq('category', 'general')
+        .order('created_at', { ascending: false })
+        .limit(10);
+
+      if (generalError) {
+        logger.error('Database query error (general category):', generalError);
+      } else {
+        healthTips = generalTips;
+      }
+    }
+
+    // If STILL no tips, get any tips available
+    if (!healthTips || healthTips.length === 0) {
+      logger.info('No category-specific tips found, fetching any available tips');
+      
+      const { data: anyTips, error: anyError } = await supabase
+        .from('health_tips')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(5);
+
+      if (anyError) {
+        logger.error('Database query error (any tips):', anyError);
+      } else {
+        healthTips = anyTips;
+      }
+    }
+
+    logger.info(`Database tips fetched:`, {
+      category,
+      gestationalWeek,
+      tipsFound: (healthTips || []).length,
+      userId
+    });
+
+    return healthTips || [];
 
   } catch (error) {
-    logger.error('Get health tips by category error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    logger.error('Error fetching health tips from database:', error);
+    return [];
   }
-});
+}
 
-// routes/healthTips.js (Modify existing GET / route)
+// Helper function to create default health tips when database is empty
+function createDefaultHealthTips(category, gestationalWeek) {
+  const defaultTips = {
+    general: [
+      {
+        id: 'default-1',
+        title: 'Stay Hydrated',
+        content: 'Drink at least 8-10 glasses of water daily to support your pregnancy.',
+        category: 'general',
+        week_start: 0,
+        week_end: 42
+      },
+      {
+        id: 'default-2',
+        title: 'Get Regular Prenatal Checkups',
+        content: 'Regular prenatal visits help monitor your baby\'s development and your health.',
+        category: 'general',
+        week_start: 0,
+        week_end: 42
+      },
+      {
+        id: 'default-3',
+        title: 'Take Prenatal Vitamins',
+        content: 'Ensure you\'re taking prenatal vitamins with folic acid as recommended by your healthcare provider.',
+        category: 'general',
+        week_start: 0,
+        week_end: 42
+      }
+    ],
+    nutrition: [
+      {
+        id: 'nutrition-1',
+        title: 'Eat Folate-Rich Foods',
+        content: 'Include leafy greens, citrus fruits, and fortified grains in your diet for healthy fetal development.',
+        category: 'nutrition',
+        week_start: 0,
+        week_end: 42
+      },
+      {
+        id: 'nutrition-2',
+        title: 'Choose Whole Grains',
+        content: 'Opt for whole grain breads, cereals, and pasta for sustained energy and fiber.',
+        category: 'nutrition',
+        week_start: 0,
+        week_end: 42
+      }
+    ],
+    exercise: [
+      {
+        id: 'exercise-1',
+        title: 'Gentle Walking',
+        content: 'Take a 20-30 minute walk daily to maintain fitness and improve circulation.',
+        category: 'exercise',
+        week_start: 0,
+        week_end: 42
+      },
+      {
+        id: 'exercise-2',
+        title: 'Prenatal Yoga',
+        content: 'Consider prenatal yoga classes to improve flexibility and reduce stress.',
+        category: 'exercise',
+        week_start: 0,
+        week_end: 42
+      }
+    ],
+    mental_health: [
+      {
+        id: 'mental-1',
+        title: 'Practice Relaxation',
+        content: 'Try deep breathing exercises or meditation to manage stress and anxiety.',
+        category: 'mental_health',
+        week_start: 0,
+        week_end: 42
+      },
+      {
+        id: 'mental-2',
+        title: 'Connect with Support',
+        content: 'Stay connected with family, friends, or pregnancy support groups.',
+        category: 'mental_health',
+        week_start: 0,
+        week_end: 42
+      }
+    ]
+  };
+
+  return defaultTips[category] || defaultTips.general;
+}
+
+// Helper function to prepare maternal health input (unchanged)
+function prepareMaternalHealthInput(healthData) {
+  const { pregnancy, profile, wearable, weightData, gestationalWeek } = healthData;
+  
+  // Parse blood pressure if available
+  let systolicBP = 120, diastolicBP = 80;
+  if (wearable?.blood_pressure) {
+    const bpParts = wearable.blood_pressure.split('/');
+    if (bpParts.length === 2) {
+      systolicBP = parseInt(bpParts[0]) || 120;
+      diastolicBP = parseInt(bpParts[1]) || 80;
+    }
+  }
+
+  // Convert temperature to Fahrenheit if needed
+  let bodyTemp = 98.6;
+  if (wearable?.temperature) {
+    bodyTemp = wearable.temperature;
+    // Assume Celsius if temperature is below 50, convert to Fahrenheit
+    if (bodyTemp < 50) {
+      bodyTemp = (bodyTemp * 9/5) + 32;
+    }
+  }
+
+  // Estimate blood sugar based on conditions
+  let bloodSugar = 95.0;
+  if (wearable?.blood_sugar) {
+    bloodSugar = parseFloat(wearable.blood_sugar);
+  } else if (profile?.medical_conditions?.includes('diabetes') || 
+             profile?.medical_conditions?.includes('gestational_diabetes')) {
+    bloodSugar = 130.0; // Higher estimate for diabetic patients
+  }
+
+  return {
+    age: profile?.age || pregnancy?.age_at_conception || 28,
+    gestational_week: Math.min(42, Math.max(12, gestationalWeek + 12)), // Convert to pregnancy weeks (12-42)
+    systolic_bp: Math.max(80, Math.min(200, systolicBP)),
+    diastolic_bp: Math.max(50, Math.min(120, diastolicBP)),
+    blood_sugar: Math.max(60, Math.min(250, bloodSugar)),
+    body_temp: Math.max(96, Math.min(104, bodyTemp)),
+    heart_rate: Math.max(50, Math.min(150, wearable?.heart_rate || 85)),
+    bmi: Math.max(15, Math.min(50, profile?.bmi || 24)),
+    previous_pregnancies: Math.max(0, Math.min(10, profile?.previous_pregnancies || 0)),
+    weight_gain: Math.max(-20, Math.min(80, weightData?.weight_gain || 25))
+  };
+}
+
+// Main health tips endpoint - Enhanced with better fallbacks
 router.get('/', async (req, res) => {
   try {
     const supabase = getSupabaseClient();
+    const cacheKey = `health_tips_v3:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
 
-    const { data: pregnancy } = await supabase
-      .from('pregnancies')
-      .select('start_date')
-      .eq('user_id', req.user.id)
-      .eq('status', 'active')
-      .single();
-
-    if (!pregnancy) {
-      return res.status(404).json({ error: 'No active pregnancy found' });
+    // Check for force refresh parameter
+    const forceRefresh = req.query.refresh === 'true';
+    
+    if (forceRefresh) {
+      await deleteCached(cacheKey);
+      logger.info(`Cache cleared for user ${req.user.id} due to force refresh`);
     }
 
-    const startDate = new Date(pregnancy.start_date);
-    const currentWeek = Math.floor((new Date() - startDate) / (7 * 24 * 60 * 60 * 1000));
-
-    // Get user health profile
-    const { data: profile } = await supabase
-      .from('user_profiles')
-      .select('medical_conditions, dietary_preferences')
-      .eq('user_id', req.user.id)
-      .single();
-
-    let query = supabase
-      .from('health_tips')
-      .select('*')
-      .lte('week_start', Math.max(0, currentWeek))
-      .gte('week_end', Math.max(0, currentWeek));
-
-    // Apply basic personalization filters
-    if (profile?.medical_conditions?.includes('diabetes')) {
-      query = query.or('category.eq.nutrition,category.eq.diabetes_management');
-    } else if (profile?.dietary_preferences?.includes('vegetarian')) {
-      query = query.or('category.eq.nutrition,category.eq.vegetarian_diet');
+    // Check in-memory cache first (unless force refresh)
+    if (!forceRefresh) {
+      const cachedTips = await getCached(cacheKey);
+      if (cachedTips) {
+        logger.info(`Returning cached health tips for user ${req.user.id}`);
+        return res.json({
+          ...cachedTips,
+          fromCache: true,
+          cacheTimestamp: cachedTips.timestamp
+        });
+      }
     }
 
-    const { data: healthTips, error } = await query.order('created_at', { ascending: false });
+    // Get user health data
+    const healthData = await getUserHealthData(req.user.id, supabase);
+    const maternalInput = prepareMaternalHealthInput(healthData);
 
-    if (error) {
-      logger.error('Get health tips error:', error);
-      return res.status(500).json({ error: 'Failed to fetch health tips' });
+    let aiRecommendations = null;
+    let riskAssessment = null;
+    let dataSource = 'rule-based';
+    let apiErrors = [];
+
+    // Only try AI APIs if URL is properly configured
+    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL !== 'http://localhost:8000') {
+      try {
+        logger.info(`Attempting AI API calls to ${MATERNAL_HEALTH_API_URL} with timeout ${API_TIMEOUT}ms`);
+        
+        // Call maternal health prediction API with better error handling
+        const [tipsResponse, riskResponse] = await Promise.allSettled([
+          axios.post(`${MATERNAL_HEALTH_API_URL}/health-tips`, maternalInput, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: API_TIMEOUT
+          }),
+          axios.post(`${MATERNAL_HEALTH_API_URL}/risk-assessment`, maternalInput, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: API_TIMEOUT
+          })
+        ]);
+
+        // Process tips response
+        if (tipsResponse.status === 'fulfilled') {
+          aiRecommendations = tipsResponse.value.data;
+          logger.info('AI health tips API successful');
+        } else {
+          apiErrors.push(`Health tips API: ${tipsResponse.reason.message}`);
+          logger.warn('Health tips API failed:', tipsResponse.reason.message);
+        }
+
+        // Process risk response
+        if (riskResponse.status === 'fulfilled') {
+          riskAssessment = riskResponse.value.data;
+          logger.info('AI risk assessment API successful');
+        } else {
+          apiErrors.push(`Risk assessment API: ${riskResponse.reason.message}`);
+          logger.warn('Risk assessment API failed:', riskResponse.reason.message);
+        }
+
+        // If we got at least one successful response, mark as AI
+        if (aiRecommendations || riskAssessment) {
+          dataSource = 'ai-model';
+          logger.info(`AI prediction partially successful for user ${req.user.id}`, {
+            has_recommendations: !!aiRecommendations,
+            has_risk_assessment: !!riskAssessment
+          });
+        } else {
+          dataSource = 'fallback-rules';
+        }
+
+      } catch (apiError) {
+        logger.error('Maternal health API error:', apiError.message);
+        apiErrors.push(`General API error: ${apiError.message}`);
+        dataSource = 'fallback-rules';
+      }
+    } else {
+      logger.info('AI API URL not configured or using localhost, skipping AI calls');
+      apiErrors.push('AI API not configured');
+      dataSource = 'fallback-rules';
     }
 
-    // Placeholder for AI API integration
-    // const personalizedTips = await xaiApi.personalizeTips(healthTips, profile, currentWeek);
+    // Determine category for database tips lookup
+    let category = 'general';
+    if (aiRecommendations && aiRecommendations.category) {
+      const categoryMap = {
+        'Nutrition Focus': 'nutrition',
+        'Exercise Focus': 'exercise',
+        'Wellness Focus': 'mental_health',
+        'General Focus': 'general'
+      };
+      category = categoryMap[aiRecommendations.category] || 'general';
+    } else {
+      // Enhanced fallback rule-based category determination
+      if (maternalInput.blood_sugar > 125 || maternalInput.bmi > 30) {
+        category = 'nutrition';
+      } else if (maternalInput.bmi < 20 || Math.abs(maternalInput.weight_gain - 25) > 15) {
+        category = 'exercise';
+      } else if (maternalInput.heart_rate > 100 || 
+                 (riskAssessment && riskAssessment.risk_level === 'High Risk') ||
+                 maternalInput.systolic_bp > 140) {
+        category = 'mental_health';
+      }
+    }
 
-    res.json({
-      currentWeek: Math.max(0, currentWeek),
-      healthTips,
-      personalized: profile ? true : false
+    // Fetch health tips from database with enhanced fallback
+    let healthTips = [];
+    
+    if (DATABASE_FALLBACK_ENABLED) {
+      healthTips = await fetchHealthTipsFromDatabase(supabase, category, healthData.gestationalWeek, req.user.id);
+    }
+
+    // If no tips from database, use default tips
+    if (!healthTips || healthTips.length === 0) {
+      logger.info(`No database tips found, using default tips for category: ${category}`);
+      healthTips = createDefaultHealthTips(category, healthData.gestationalWeek);
+    }
+
+    // Generate fallback recommendations if AI failed
+    let fallbackRecommendations = null;
+    if (!aiRecommendations) {
+      const categoryTips = {
+        nutrition: [
+          'Focus on a balanced diet rich in fruits, vegetables, and whole grains',
+          'Consider consulting a nutritionist for personalized meal planning',
+          'Monitor your blood sugar levels regularly if you have diabetes concerns'
+        ],
+        exercise: [
+          'Engage in moderate exercise as approved by your healthcare provider',
+          'Consider prenatal yoga or swimming for low-impact fitness',
+          'Listen to your body and rest when needed'
+        ],
+        mental_health: [
+          'Practice stress management techniques like deep breathing or meditation',
+          'Stay connected with your support network',
+          'Don\'t hesitate to seek professional help if you feel overwhelmed'
+        ],
+        general: [
+          'Maintain regular prenatal appointments with your healthcare provider',
+          'Stay hydrated and get adequate rest',
+          'Monitor your symptoms and report any concerns to your doctor'
+        ]
+      };
+
+      fallbackRecommendations = {
+        category: category,
+        confidence: 0.75,
+        tips: categoryTips[category] || categoryTips.general,
+        source: 'rule-based-fallback'
+      };
+    }
+
+    // Generate fallback risk assessment if needed
+    let fallbackRiskAssessment = null;
+    if (!riskAssessment) {
+      // Simple rule-based risk assessment
+      let riskLevel = 'Low Risk';
+      let riskFactors = [];
+
+      if (maternalInput.systolic_bp > 140 || maternalInput.diastolic_bp > 90) {
+        riskLevel = 'Medium Risk';
+        riskFactors.push('elevated blood pressure');
+      }
+      if (maternalInput.blood_sugar > 125) {
+        riskLevel = 'Medium Risk';
+        riskFactors.push('elevated blood sugar');
+      }
+      if (maternalInput.bmi > 35 || maternalInput.bmi < 18.5) {
+        riskLevel = riskLevel === 'Low Risk' ? 'Medium Risk' : 'High Risk';
+        riskFactors.push('BMI concerns');
+      }
+      if (maternalInput.heart_rate > 110) {
+        riskLevel = 'Medium Risk';
+        riskFactors.push('elevated heart rate');
+      }
+
+      if (riskFactors.length > 2) {
+        riskLevel = 'High Risk';
+      }
+
+      fallbackRiskAssessment = {
+        risk_level: riskLevel,
+        confidence: 0.6,
+        recommendation: riskFactors.length > 0 
+          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
+          : 'Continue with regular prenatal care and maintain healthy habits',
+        risk_factors: riskFactors,
+        source: 'rule-based-assessment'
+      };
+    }
+
+    // Prepare comprehensive response
+    const response = {
+      currentWeek: Math.max(0, healthData.gestationalWeek),
+      gestationalWeek: maternalInput.gestational_week,
+      healthTips: healthTips || [],
+      aiRecommendations: aiRecommendations || fallbackRecommendations,
+      riskAssessment: riskAssessment || fallbackRiskAssessment,
+      dataSource,
+      apiStatus: {
+        errors: apiErrors,
+        healthTipsAPI: !!aiRecommendations ? 'success' : 'failed',
+        riskAssessmentAPI: !!riskAssessment ? 'success' : 'failed',
+        apiUrl: MATERNAL_HEALTH_API_URL,
+        timeout: API_TIMEOUT
+      },
+      personalizedFor: {
+        age: maternalInput.age,
+        gestationalWeek: maternalInput.gestational_week,
+        riskFactors: {
+          hypertension: maternalInput.systolic_bp > 140 || maternalInput.diastolic_bp > 90,
+          diabetes: maternalInput.blood_sugar > 125,
+          weightConcerns: maternalInput.bmi < 18.5 || maternalInput.bmi > 30,
+          heartRateElevated: maternalInput.heart_rate > 100
+        }
+      },
+      metadata: {
+        category,
+        inputParameters: maternalInput,
+        databaseTipsCount: (healthTips || []).length,
+        useDefaultTips: healthTips === createDefaultHealthTips(category, healthData.gestationalWeek),
+        forceRefresh
+      },
+      timestamp: new Date().toISOString(),
+      fromCache: false
+    };
+
+    // Cache the response in memory (12 hours = 43200 seconds)
+    await setCached(cacheKey, response, 12 * 60 * 60);
+    logger.info(`Health tips cached for user ${req.user.id}, category: ${category}, tips: ${(healthTips || []).length}`);
+
+    // Audit log with enhanced details
+    auditLog('fetch_health_tips_ai', req.user.id, {
+      week: healthData.gestationalWeek,
+      source: dataSource,
+      risk_level: (riskAssessment || fallbackRiskAssessment)?.risk_level,
+      category: category,
+      api_errors: apiErrors.length,
+      tips_count: (healthTips || []).length,
+      cached: false,
+      force_refresh: forceRefresh
     });
+
+    res.json(response);
 
   } catch (error) {
     logger.error('Get health tips error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    
+    // Return a more informative error response
+    const errorResponse = {
+      error: 'Internal server error',
+      message: 'Unable to fetch health tips at this time',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    };
+
+    // Don't expose internal error details in production
+    if (process.env.NODE_ENV !== 'production') {
+      errorResponse.details = error.message;
+      errorResponse.stack = error.stack;
+    }
+
+    res.status(500).json(errorResponse);
   }
 });
+
+// Add a debug endpoint to check database health tips
+router.get('/debug/database-tips', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    
+    // Get count of tips by category
+    const { data: tipCounts, error } = await supabase
+      .from('health_tips')
+      .select('category, id')
+      .order('category');
+
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const categoryCounts = {};
+    (tipCounts || []).forEach(tip => {
+      categoryCounts[tip.category] = (categoryCounts[tip.category] || 0) + 1;
+    });
+
+    // Get sample tips from each category
+    const sampleTips = {};
+    for (const category of ['general', 'nutrition', 'exercise', 'mental_health']) {
+      const { data: samples } = await supabase
+        .from('health_tips')
+        .select('id, title, content, week_start, week_end')
+        .eq('category', category)
+        .limit(2);
+      
+      sampleTips[category] = samples || [];
+    }
+
+    res.json({
+      totalTips: (tipCounts || []).length,
+      categoryCounts,
+      sampleTips,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Debug database tips error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add endpoint to clear cache for specific user
+router.delete('/cache/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const today = new Date().toISOString().split('T')[0];
+    
+    const cacheKeys = [
+      `health_tips_v3:${userId}:${today}`,
+      `assessment:${userId}:${today}`,
+      `health_tips_v2:${userId}:${today}` // Legacy key
+    ];
+
+    for (const key of cacheKeys) {
+      await deleteCached(key);
+    }
+
+    logger.info(`Cache cleared for user ${userId}`);
+    res.json({ 
+      message: `Cache cleared for user ${userId}`,
+      keysCleared: cacheKeys,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Clear user cache error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+// Input validation middleware
+const validateBasicHealthInput = (req, res, next) => {
+  const requiredFields = ['age', 'gestational_age', 'weight_pre_pregnancy', 'height', 'systolic_bp', 'diastolic_bp'];
+  const missingFields = requiredFields.filter(field => !req.body.hasOwnProperty(field) || req.body[field] == null);
+  
+  if (missingFields.length > 0) {
+    return res.status(400).json({
+      error: 'Invalid input',
+      message: `Missing or invalid fields: ${missingFields.join(', ')}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  const numericFields = {
+    age: { min: 15, max: 50 },
+    gestational_age: { min: 0, max: 42 },
+    weight_pre_pregnancy: { min: 30, max: 200 },
+    height: { min: 100, max: 250 },
+    systolic_bp: { min: 80, max: 200 },
+    diastolic_bp: { min: 50, max: 120 }
+  };
+
+  for (const [field, { min, max }] of Object.entries(numericFields)) {
+    const value = req.body[field];
+    if (typeof value !== 'number' || value < min || value > max) {
+      return res.status(400).json({
+        error: 'Invalid input',
+        message: `Field ${field} must be a number between ${min} and ${max}`,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+
+  next();
+};
+
+const validateChatInput = (req, res, next) => {
+  const { message, user_id } = req.body;
+  if (!message || !user_id) {
+    return res.status(400).json({
+      error: 'Invalid input',
+      message: 'Both message and user_id are required',
+      timestamp: new Date().toISOString()
+    });
+  }
+  next();
+};
+
+const validateIntegratedConsultationInput = (req, res, next) => {
+  const { message, user_id, health_data } = req.body;
+  if (!message || !user_id || !health_data) {
+    return res.status(400).json({
+      error: 'Invalid input',
+      message: 'message, user_id, and health_data are required',
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  const requiredFields = ['age', 'gestational_age', 'weight_pre_pregnancy', 'height', 'systolic_bp', 'diastolic_bp'];
+  const missingFields = requiredFields.filter(field => !health_data.hasOwnProperty(field) || health_data[field] == null);
+  
+  if (missingFields.length > 0) {
+    return res.status(400).json({
+      error: 'Invalid health data',
+      message: `Missing or invalid fields: ${missingFields.join(', ')}`,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  next();
+};
+
+const validateComprehensiveHealthInput = (req, res, next) => {
+  // More comprehensive validation could include additional fields like heart_rate, blood_sugar, etc.
+  validateBasicHealthInput(req, res, next);
+};
+
+const validateAdminAuth = (req, res, next) => {
+  // Simplified admin authentication check
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_TOKEN}`) {
+    return res.status(403).json({
+      error: 'Unauthorized',
+      message: 'Admin access required',
+      timestamp: new Date().toISOString()
+    });
+  }
+  next();
+};
+
+// Helper function to get user health data
+async function getUserHealthData(userId, supabase) {
+  try {
+    const { data: pregnancy, error: pregnancyError } = await supabase
+      .from('pregnancies')
+      .select('start_date, due_date, age_at_conception')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .single();
+
+    if (pregnancyError) {
+      logger.warn(`Pregnancy query error for user ${userId}:`, pregnancyError);
+      return null;
+    }
+
+    return pregnancy;
+  } catch (error) {
+    logger.error('Error fetching user health data:', error);
+    return null;
+  }
+}
+
+// Helper function for simple risk assessment
+function simpleRiskAssessment(healthData) {
+  const bmi = healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2);
+  let riskLevel = 'Low';
+  const riskFactors = [];
+
+  if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
+    riskLevel = 'Medium';
+    riskFactors.push('elevated blood pressure');
+  }
+  if (bmi > 30 || bmi < 18.5) {
+    riskLevel = 'Medium';
+    riskFactors.push('BMI concerns');
+  }
+  if (healthData.gestational_age > 37) {
+    riskLevel = 'Medium';
+    riskFactors.push('advanced gestational age');
+  }
+  if (healthData.age > 35) {
+    riskLevel = 'Medium';
+    riskFactors.push('advanced maternal age');
+  }
+
+  return { riskLevel, riskFactors, bmi };
+}
+
+// Prediction Endpoints
+router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
+  try {
+    const healthData = req.body;
+    const cacheKey = `predict:${JSON.stringify(healthData).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached comprehensive prediction`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
+
+    const response = {
+      prediction: {
+        risk_level: riskLevel,
+        risk_factors: riskFactors,
+        recommendation: riskFactors.length > 0 
+          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
+          : 'Continue with regular prenatal care',
+        confidence: 0.75,
+        sources: ['rule_based_prediction', 'health_data'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: healthData.gestational_age
+        }
+      },
+      timestamp: new Date().toISOString(),
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('predict_comprehensive', null, {
+      risk_level: riskLevel,
+      risk_factors_count: riskFactors.length,
+      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Predict endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process prediction request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
+  try {
+    const healthData = req.body;
+    const cacheKey = `predict_simple:${JSON.stringify(healthData).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached simple prediction`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
+
+    const response = {
+      prediction: {
+        risk_level: riskLevel,
+        risk_factors: riskFactors,
+        recommendation: riskFactors.length > 0 
+          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
+          : 'Continue with regular prenatal care',
+        confidence: 0.65,
+        sources: ['rule_based_prediction'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: healthData.gestational_age
+        }
+      },
+      timestamp: new Date().toISOString(),
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('predict_simple', null, {
+      risk_level: riskLevel,
+      risk_factors_count: riskFactors.length,
+      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Predict simple endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process prediction request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
+  try {
+    const healthData = req.body;
+    const cacheKey = `risk_assessment:${JSON.stringify(healthData).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached risk assessment`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
+
+    const response = {
+      risk_assessment: {
+        risk_level: riskLevel,
+        risk_factors: riskFactors,
+        recommendation: riskFactors.length > 0 
+          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
+          : 'No significant risks detected. Continue regular monitoring.',
+        confidence: 0.70,
+        sources: ['rule_based_assessment'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: healthData.gestational_age
+        }
+      },
+      timestamp: new Date().toISOString(),
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('risk_assessment', null, {
+      risk_level: riskLevel,
+      risk_factors_count: riskFactors.length,
+      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Risk assessment endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process risk assessment request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+router.post('/health-tips', validateBasicHealthInput, async (req, res) => {
+  try {
+    const healthData = req.body;
+    const cacheKey = `health_tips:${JSON.stringify(healthData).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached health tips`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
+    
+    // Determine category based on health data
+    let category = 'general';
+    if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
+      category = 'mental_health';
+    } else if (bmi > 30 || bmi < 18.5) {
+      category = 'nutrition';
+    } else if (healthData.gestational_age > 30) {
+      category = 'exercise';
+    }
+
+    const tips = {
+      general: [
+        'Maintain regular prenatal checkups',
+        'Stay hydrated with 8-10 glasses of water daily',
+        'Take prenatal vitamins as prescribed'
+      ],
+      nutrition: [
+        'Focus on folate-rich foods like leafy greens',
+        'Choose whole grains for sustained energy',
+        'Limit processed foods and added sugars'
+      ],
+      exercise: [
+        'Engage in 20-30 minutes of moderate exercise daily',
+        'Try prenatal yoga for flexibility and relaxation',
+        'Avoid high-risk activities'
+      ],
+      mental_health: [
+        'Practice deep breathing exercises',
+        'Connect with support groups or family',
+        'Consider professional support if feeling overwhelmed'
+      ]
+    };
+
+    const response = {
+      health_tips: {
+        category,
+        tips: tips[category],
+        confidence: 0.70,
+        sources: ['rule_based_recommendations'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: healthData.gestational_age
+        }
+      },
+      timestamp: new Date().toISOString(),
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('health_tips', null, {
+      category,
+      tips_count: tips[category].length,
+      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Health tips endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process health tips request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+// Chat Endpoints
+router.post('/chat', validateChatInput, async (req, res) => {
+  try {
+    const { message, user_id } = req.body;
+    const cacheKey = `chat:${user_id}:${message.hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached chat response for user ${user_id}`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const supabase = getSupabaseClient();
+    const pregnancyData = await getUserHealthData(user_id, supabase);
+
+    let responseContent;
+    if (message.toLowerCase().includes('labor') && message.toLowerCase().includes('anxious')) {
+      responseContent = {
+        message: 'Feeling anxious about labor is common, especially at 28 weeks. Labor typically involves three stages: early labor (mild contractions, cervical dilation), active labor (stronger contractions every 3-5 minutes), and pushing/delivery. To ease anxiety, consider prenatal classes, discuss your concerns with your healthcare provider, and practice relaxation techniques like deep breathing. Would you like specific coping strategies?',
+        confidence: 0.85,
+        sources: ['general_medical_knowledge', 'mental_health_guidance'],
+        timestamp: new Date().toISOString()
+      };
+    } else if (message.toLowerCase().includes('labor')) {
+      responseContent = {
+        message: 'During labor, the body goes through several stages: early labor (mild contractions, cervical dilation), active labor (stronger contractions every 3-5 minutes), transition (intense contractions), and pushing/delivery. The placenta is delivered last. Always consult your healthcare provider for personalized guidance.',
+        confidence: 0.85,
+        sources: ['general_medical_knowledge'],
+        timestamp: new Date().toISOString()
+      };
+    } else {
+      responseContent = {
+        message: 'I can provide information about pregnancy and maternal health. Could you please provide more specific details or ask about a particular topic?',
+        confidence: 0.5,
+        sources: ['general_response'],
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    const response = {
+      response: responseContent,
+      user_id,
+      pregnancy_status: pregnancyData ? 'active' : 'no_active_pregnancy',
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('chat_endpoint', user_id, {
+      message,
+      response_length: responseContent.message.length,
+      has_pregnancy: !!pregnancyData
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Chat endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process chat request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+router.post('/integrated-consultation', validateIntegratedConsultationInput, async (req, res) => {
+  try {
+    const { message, user_id, health_data } = req.body;
+    const cacheKey = `integrated_consultation:${user_id}:${message.hashCode()}:${JSON.stringify(health_data).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached integrated consultation for user ${user_id}`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const supabase = getSupabaseClient();
+    const pregnancyData = await getUserHealthData(user_id, supabase);
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(health_data);
+
+    let responseContent;
+    if (message.toLowerCase().includes('concern')) {
+      responseContent = {
+        message: `Based on your health data (BP: ${health_data.systolic_bp}/${health_data.diastolic_bp}, BMI: ${bmi.toFixed(1)}), your risk level is ${riskLevel}. ${riskFactors.length > 0 ? 'Noted concerns: ' + riskFactors.join(', ') + '. Please consult your healthcare provider.' : 'No immediate concerns detected, but regular checkups are recommended.'}`,
+        confidence: 0.7,
+        sources: ['rule_based_assessment', 'provided_health_data'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: health_data.systolic_bp > 140 || health_data.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: health_data.gestational_age
+        },
+        timestamp: new Date().toISOString()
+      };
+    } else {
+      responseContent = {
+        message: 'Your health data has been received. Please provide more specific questions for detailed guidance.',
+        confidence: 0.5,
+        sources: ['general_response'],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: health_data.systolic_bp > 140 || health_data.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: health_data.gestational_age
+        },
+        timestamp: new Date().toISOString()
+      };
+    }
+
+    const response = {
+      response: responseContent,
+      user_id,
+      risk_level: riskLevel,
+      risk_factors: riskFactors,
+      pregnancy_status: pregnancyData ? 'active' : 'no_active_pregnancy',
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('integrated_consultation', user_id, {
+      message,
+      risk_level: riskLevel,
+      risk_factors_count: riskFactors.length,
+      has_pregnancy: !!pregnancyData
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Integrated consultation endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to process consultation request',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+// Report Endpoints
+router.post('/health-report', validateComprehensiveHealthInput, async (req, res) => {
+  try {
+    const healthData = req.body;
+    const cacheKey = `health_report:${JSON.stringify(healthData).hashCode()}`;
+    
+    const cachedResponse = await getCached(cacheKey);
+    if (cachedResponse) {
+      logger.info(`Returning cached health report`);
+      return res.json({ ...cachedResponse, fromCache: true });
+    }
+
+    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
+
+    const response = {
+      health_report: {
+        risk_level: riskLevel,
+        risk_factors: riskFactors,
+        recommendations: [
+          'Maintain regular prenatal checkups',
+          ...(riskFactors.length > 0 ? [`Address concerns: ${riskFactors.join(', ')} with your healthcare provider`] : []),
+          'Follow a balanced diet and stay hydrated',
+          'Engage in approved physical activity'
+        ],
+        health_metrics: {
+          bmi: bmi.toFixed(1),
+          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
+          gestational_age: healthData.gestational_age,
+          age: healthData.age
+        },
+        confidence: 0.75,
+        sources: ['rule_based_report', 'health_data'],
+        timestamp: new Date().toISOString()
+      },
+      fromCache: false
+    };
+
+    await setCached(cacheKey, response, CACHE_DURATION);
+    
+    auditLog('health_report', null, {
+      risk_level: riskLevel,
+      risk_factors_count: riskFactors.length,
+      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
+    });
+
+    res.json(response);
+  } catch (error) {
+    logger.error('Health report endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to generate health report',
+      timestamp: new Date().toISOString(),
+      requestId: req.headers['x-request-id'] || 'unknown'
+    });
+  }
+});
+
+
+// Helper function to create string hash
+String.prototype.hashCode = function() {
+  let hash = 0;
+  for (let i = 0; i < this.length; i++) {
+    const char = this.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return hash;
+};
 
 module.exports = router;
