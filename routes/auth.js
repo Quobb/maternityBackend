@@ -32,14 +32,7 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Rate limiting configurations
-const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 5, // 5 attempts per window per IP
-  message: { error: 'Too many authentication attempts. Please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+
 
 const otpLimiter = rateLimit({
   windowMs: 5 * 60 * 1000, // 5 minutes
@@ -49,13 +42,7 @@ const otpLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const resetLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 3, // 3 password reset attempts per hour per IP
-  message: { error: 'Too many password reset requests. Please try again later.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+
 
 // Helper function to validate environment variables
 const validateEnvVars = () => {
@@ -185,7 +172,7 @@ const handleValidationErrors = (req, res, next) => {
 };
 
 // Register
-router.post('/register', authLimiter, validateRegistration, async (req, res) => {
+router.post('/register', validateRegistration, async (req, res) => {
   try {
     validateEnvVars();
     
@@ -254,7 +241,7 @@ router.post('/register', authLimiter, validateRegistration, async (req, res) => 
 });
 
 // Login
-router.post('/login', authLimiter, validateLogin, async (req, res) => {
+router.post('/login', validateLogin, async (req, res) => {
   try {
     validateEnvVars();
     
@@ -508,7 +495,7 @@ router.delete('/me', authenticateToken, async (req, res) => {
 });
 
 // Password Reset Request
-router.post('/password-reset', resetLimiter, async (req, res) => {
+router.post('/password-reset', async (req, res) => {
   try {
     const { email } = req.body;
 
@@ -596,7 +583,7 @@ router.post('/password-reset', resetLimiter, async (req, res) => {
 });
 
 // Verify Password Reset Token
-router.post('/password-reset/verify', authLimiter, async (req, res) => {
+router.post('/password-reset/verify', async (req, res) => {
   try {
     const { token, newPassword } = req.body;
 
@@ -1027,12 +1014,7 @@ router.post('/resend-phone-otp', otpLimiter, async (req, res) => {
 });
 
 // POST - Create user profile
-router.post(
-  '/user-profile',
-  authenticateToken,
-  validateProfileCreation,
-  handleValidationErrors,
-  async (req, res) => {
+router.post('/user-profile',authenticateToken,validateProfileCreation,handleValidationErrors, async (req, res) => {
     try {
       const { age, bmi, medical_conditions, previous_pregnancies, gestational_week, weight } = req.body;
       const user_id = req.user?.id;
