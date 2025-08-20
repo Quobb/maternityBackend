@@ -121,50 +121,48 @@ router.get('/', async (req, res) => {
 });
 
 // routes/kickCount.js (Add to existing file)
-router.get('/chart', async (req, res) => {
+router.get("/chart", async (req, res) => {
   try {
     const { days = 7 } = req.query;
     const supabase = getSupabaseClient();
 
-    const pregnancy = await supabase
-      .from('pregnancies')
-      .select('id')
-      .eq('user_id', req.user.id)
-      .eq('status', 'active')
+    // Find active pregnancy for user
+    const { data: pregnancy, error: pregError } = await supabase
+      .from("pregnancies")
+      .select("id")
+      .eq("user_id", req.user.id)
+      .eq("status", "active")
       .single();
 
-    if (!pregnancy.data) {
-      return res.status(404).json({ error: 'No active pregnancy found' });
+    if (pregError || !pregnancy) {
+      return res.status(404).json({ error: "No active pregnancy found" });
     }
 
     const fromDate = new Date();
     fromDate.setDate(fromDate.getDate() - parseInt(days));
 
     const { data: kickCounts, error } = await supabase
-      .from('kick_counts')
-      .select('timestamp, count')
-      .eq('pregnancy_id', pregnancy.data.id)
-      .gte('timestamp', fromDate.toISOString())
-      .order('timestamp', { ascending: true });
+      .from("kick_counts")
+      .select("timestamp, count")
+      .eq("pregnancy_id", pregnancy.id)
+      .gte("timestamp", fromDate.toISOString())
+      .order("timestamp", { ascending: true });
 
     if (error) {
-      logger.error('Get kick count chart data error:', error);
-      return res.status(500).json({ error: 'Failed to fetch chart data' });
+      return res.status(500).json({ error: "Failed to fetch chart data" });
     }
 
-    const labels = [];
-    const counts = [];
+    // Aggregate by date
     const dateMap = {};
-
     kickCounts.forEach(kick => {
-      const date = kick.timestamp.split('T')[0];
-      if (!dateMap[date]) {
-        dateMap[date] = { total: 0, sessions: 0 };
-      }
+      const date = kick.timestamp.split("T")[0];
+      if (!dateMap[date]) dateMap[date] = { total: 0, sessions: 0 };
       dateMap[date].total += kick.count;
       dateMap[date].sessions += 1;
     });
 
+    const labels = [];
+    const counts = [];
     Object.keys(dateMap)
       .sort()
       .forEach(date => {
@@ -172,37 +170,12 @@ router.get('/chart', async (req, res) => {
         counts.push(Math.round(dateMap[date].total / dateMap[date].sessions));
       });
 
-    res.json({
-      chart: {
-        type: 'bar',
-        data: {
-          labels,
-          datasets: [{
-            label: 'Average Daily Kick Counts',
-            data: counts,
-            backgroundColor: 'rgba(75, 192, 192, 0.6)',
-            borderColor: 'rgba(75, 192, 192, 1)',
-            borderWidth: 1
-          }]
-        },
-        options: {
-          scales: {
-            y: {
-              beginAtZero: true,
-              title: { display: true, text: 'Kicks per Session' }
-            },
-            x: {
-              title: { display: true, text: 'Date' }
-            }
-          }
-        }
-      }
-    });
-
-  } catch (error) {
-    logger.error('Get kick count chart error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.json({ labels, counts });
+  } catch (err) {
+    console.error("Chart error:", err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
+
 
 module.exports = router;
