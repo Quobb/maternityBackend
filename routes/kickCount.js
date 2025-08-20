@@ -163,14 +163,35 @@ router.get("/chart", async (req, res) => {
 
     const labels = [];
     const counts = [];
-    Object.keys(dateMap)
-      .sort()
-      .forEach(date => {
-        labels.push(date);
-        counts.push(Math.round(dateMap[date].total / dateMap[date].sessions));
-      });
+    
+    // Generate all dates in the range to show gaps
+    const currentDate = new Date(fromDate);
+    const endDate = new Date();
+    
+    while (currentDate <= endDate) {
+      const dateStr = currentDate.toISOString().split("T")[0];
+      labels.push(dateStr);
+      
+      if (dateMap[dateStr]) {
+        counts.push(Math.round(dateMap[dateStr].total / dateMap[dateStr].sessions));
+      } else {
+        counts.push(0); // No data for this date
+      }
+      
+      currentDate.setDate(currentDate.getDate() + 1);
+    }
 
-    res.json({ labels, counts });
+    // Return data in the format expected by frontend
+    res.json({
+      chart: {
+        data: {
+          labels: labels,
+          datasets: [{
+            data: counts
+          }]
+        }
+      }
+    });
   } catch (err) {
     console.error("Chart error:", err);
     res.status(500).json({ error: "Internal server error" });
