@@ -10,15 +10,13 @@ const router = express.Router();
 // Create appointment
 router.post('/', requireRole(['mother']), validateAppointment, async (req, res) => {
   try {
-    const { doctor_id, scheduled_at, notes,type } = req.body;
+    const { doctor_id,appointment_date,time,notes,type } = req.body;
     const supabase = getSupabaseClient();
 
     // Verify doctor exists and has correct role
     const { data: doctor } = await supabase
       .from('users')
       .select('id, role')
-      .eq('id', doctor_id)
-      .eq('role', 'doctor')
       .single();
 
     if (!doctor) {
@@ -33,13 +31,14 @@ router.post('/', requireRole(['mother']), validateAppointment, async (req, res) 
         user_id: req.user.id,
         type,
         doctor_id,
-        scheduled_at,
+        appointment_date,
+        time,
         status: 'scheduled',
         notes
       }])
       .select(`
         *,
-        doctor:users!appointments_doctor_id_fkey(id, full_name, email)
+        doctor(id, name, specialty)
       `)
       .single();
 
