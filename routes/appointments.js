@@ -151,7 +151,7 @@ router.get('/doctors', async (req, res) => {
 
     const { data: doctors, error } = await supabase
       .from('doctors')
-      .select('id, name, specialty, experience, rating, image, nextAvailable, consultationFee, languages')
+      .select('id, name, specialty, experience, rating, image, nextavailable, consultationfee, languages')
       .order('name', { ascending: true });
 
     if (error) {
