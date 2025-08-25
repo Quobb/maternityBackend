@@ -1495,9 +1495,9 @@ router.get('/doctors', async (req, res) => {
 
     // Try to fetch from database first
     const { data: doctors, error } = await supabase
-      .from('healthcare_providers')
+      .from('users')
       .select('*')
-      .eq('status', 'active')
+      .eq('status', 'doctor')
       .order('rating', { ascending: false });
 
     if (error) {

@@ -139,10 +139,9 @@ router.get('/doctors', async (req, res) => {
     const supabase = getSupabaseClient();
 
     const { data: doctors, error } = await supabase
-      .from('users')
-      .select('id, full_name, email')
-      .eq('role', 'doctor')
-      .order('full_name', { ascending: true });
+      .from('doctors')
+      .select('id, name, specialty,experience,rating,image,nextAvailable,consultationFee,languages')
+      .order('name', { ascending: true });
 
     if (error) {
       logger.error('Get doctors error:', error);
