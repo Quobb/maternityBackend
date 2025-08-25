@@ -53,8 +53,19 @@ const validateKickCount = [
 
 const validateAppointment = [
   body('doctor_id').isUUID(),
-  body('scheduled_at').isISO8601().toDate(),
-  body('notes').optional().trim().isLength({ max: 1000 }),
+ body('appointment_date')
+    .isISO8601()
+    .withMessage('Appointment date must be a valid date (YYYY-MM-DD)'),
+
+  body('time')
+    .matches(/^\d{2}:\d{2}(:\d{2})?$/)
+    .withMessage('Time must be in HH:MM or HH:MM:SS format'),
+
+  body('notes')
+    .optional()
+    .trim()
+    .isLength({ max: 1000 })
+    .withMessage('Notes cannot exceed 1000 characters'),
   handleValidationErrors
 ];
 
