@@ -1265,6 +1265,430 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
 });
 
 
+// Add these endpoints to your existing healthTips.js router
+
+// Health Assessment endpoint (called by HealthAssessmentScreen)
+router.get('/health-assessment', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    const cacheKey = `health_assessment:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
+
+    // Check cache first
+    const cachedAssessment = await getCached(cacheKey);
+    if (cachedAssessment) {
+      logger.info(`Returning cached health assessment for user ${req.user.id}`);
+      return res.json({
+        ...cachedAssessment,
+        fromCache: true
+      });
+    }
+
+    // Get user health data
+    const healthData = await getUserHealthData(req.user.id, supabase);
+    const maternalInput = prepareMaternalHealthInput(healthData);
+
+    let aiRecommendations = null;
+    let riskAssessment = null;
+    let dataSource = 'rule-based';
+
+    // Try AI APIs if configured
+    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL !== 'http://localhost:8000') {
+      try {
+        const [tipsResponse, riskResponse] = await Promise.allSettled([
+          axios.post(`${MATERNAL_HEALTH_API_URL}/health-tips`, maternalInput, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: API_TIMEOUT
+          }),
+          axios.post(`${MATERNAL_HEALTH_API_URL}/risk-assessment`, maternalInput, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: API_TIMEOUT
+          })
+        ]);
+
+        if (tipsResponse.status === 'fulfilled') {
+          aiRecommendations = tipsResponse.value.data;
+        }
+
+        if (riskResponse.status === 'fulfilled') {
+          riskAssessment = riskResponse.value.data;
+        }
+
+        if (aiRecommendations || riskAssessment) {
+          dataSource = 'ai-model';
+        }
+      } catch (error) {
+        logger.error('AI API error in health assessment:', error);
+      }
+    }
+
+    // Generate fallback risk assessment if needed
+    if (!riskAssessment) {
+      const { riskLevel, riskFactors } = simpleRiskAssessment({
+        age: maternalInput.age,
+        gestational_age: maternalInput.gestational_week - 12,
+        weight_pre_pregnancy: 65, // Default estimate
+        height: 165, // Default estimate
+        systolic_bp: maternalInput.systolic_bp,
+        diastolic_bp: maternalInput.diastolic_bp
+      });
+
+      riskAssessment = {
+        risk_level: riskLevel,
+        confidence: 0.65,
+        recommendation: riskFactors.length > 0 
+          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
+          : 'Continue with regular prenatal care and maintain healthy habits'
+      };
+    }
+
+    // Generate fallback recommendations if needed
+    if (!aiRecommendations) {
+      let category = 'general';
+      const tips = ['Maintain regular prenatal checkups', 'Stay hydrated', 'Take prenatal vitamins'];
+      
+      if (maternalInput.systolic_bp > 140) {
+        category = 'mental_health';
+        tips.push('Practice stress management techniques', 'Monitor blood pressure regularly');
+      } else if (maternalInput.bmi > 30) {
+        category = 'nutrition';
+        tips.push('Focus on balanced nutrition', 'Consult with a nutritionist');
+      }
+
+      aiRecommendations = {
+        category: category,
+        confidence: 0.6,
+        tips: tips
+      };
+    }
+
+    // Mock risk factors for detailed analysis
+    const riskFactors = [
+      {
+        factor: 'Age',
+        level: maternalInput.age > 35 ? 'Medium' : 'Low',
+        description: `Age ${maternalInput.age} years`,
+        impact: maternalInput.age > 35 ? 'Advanced maternal age may increase certain risks' : 'Age within normal range'
+      },
+      {
+        factor: 'Blood Pressure',
+        level: maternalInput.systolic_bp > 140 ? 'High' : maternalInput.systolic_bp > 120 ? 'Medium' : 'Low',
+        description: `BP ${maternalInput.systolic_bp}/${maternalInput.diastolic_bp} mmHg`,
+        impact: maternalInput.systolic_bp > 140 ? 'Elevated blood pressure requires monitoring' : 'Blood pressure within normal range'
+      },
+      {
+        factor: 'BMI',
+        level: maternalInput.bmi > 30 ? 'High' : maternalInput.bmi < 18.5 ? 'Medium' : 'Low',
+        description: `BMI ${maternalInput.bmi.toFixed(1)}`,
+        impact: maternalInput.bmi > 30 ? 'High BMI may increase pregnancy complications' : 'BMI within acceptable range'
+      }
+    ];
+
+    const response = {
+      currentWeek: healthData.gestationalWeek,
+      riskAssessment,
+      aiRecommendations,
+      riskFactors,
+      dataSource,
+      timestamp: new Date().toISOString()
+    };
+
+    // Cache for 6 hours
+    await setCached(cacheKey, response, 6 * 60 * 60);
+
+    auditLog('health_assessment', req.user.id, {
+      risk_level: riskAssessment.risk_level,
+      data_source: dataSource,
+      week: healthData.gestationalWeek
+    });
+
+    res.json(response);
+
+  } catch (error) {
+    logger.error('Health assessment error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to fetch health assessment',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Detailed Report endpoint (called by DetailedReportScreen)
+router.get('/detailed-report', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    const healthData = await getUserHealthData(req.user.id, supabase);
+    const maternalInput = prepareMaternalHealthInput(healthData);
+
+    // Generate comprehensive report data
+    const { riskLevel, riskFactors } = simpleRiskAssessment({
+      age: maternalInput.age,
+      gestational_age: maternalInput.gestational_week - 12,
+      weight_pre_pregnancy: 65,
+      height: 165,
+      systolic_bp: maternalInput.systolic_bp,
+      diastolic_bp: maternalInput.diastolic_bp
+    });
+
+    const response = {
+      assessmentData: {
+        riskAssessment: {
+          risk_level: riskLevel,
+          confidence: 0.75,
+          recommendation: riskFactors.length > 0 
+            ? `Key areas to discuss with your healthcare provider: ${riskFactors.join(', ')}`
+            : 'Your current health metrics show no immediate concerns. Continue with regular prenatal care.'
+        },
+        aiRecommendations: {
+          category: 'General Focus',
+          confidence: 0.7,
+          tips: [
+            'Maintain regular prenatal appointments',
+            'Follow a balanced diet rich in nutrients',
+            'Stay physically active as approved by your doctor',
+            'Monitor your symptoms and report any concerns'
+          ]
+        },
+        currentWeek: healthData.gestationalWeek
+      },
+      riskFactors: [
+        {
+          factor: 'Maternal Age',
+          level: maternalInput.age > 35 ? 'Medium' : 'Low',
+          value: `${maternalInput.age} years`,
+          description: maternalInput.age > 35 ? 'Advanced maternal age' : 'Age within optimal range',
+          impact: maternalInput.age > 35 ? 'May require additional monitoring' : 'No additional concerns',
+          recommendation: maternalInput.age > 35 ? 'Discuss genetic screening options with your provider' : 'Continue standard care'
+        },
+        {
+          factor: 'Blood Pressure',
+          level: maternalInput.systolic_bp > 140 ? 'High' : 'Low',
+          value: `${maternalInput.systolic_bp}/${maternalInput.diastolic_bp} mmHg`,
+          description: maternalInput.systolic_bp > 140 ? 'Elevated blood pressure' : 'Normal blood pressure',
+          impact: maternalInput.systolic_bp > 140 ? 'Increased risk of preeclampsia' : 'Healthy cardiovascular status',
+          recommendation: maternalInput.systolic_bp > 140 ? 'Regular BP monitoring and lifestyle modifications' : 'Maintain current healthy habits'
+        }
+      ]
+    };
+
+    auditLog('detailed_report', req.user.id, {
+      risk_level: riskLevel,
+      week: healthData.gestationalWeek
+    });
+
+    res.json(response);
+
+  } catch (error) {
+    logger.error('Detailed report error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to generate detailed report',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Doctors endpoint (called by ConsultationScreen)
+router.get('/doctors', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+
+    // Try to fetch from database first
+    const { data: doctors, error } = await supabase
+      .from('healthcare_providers')
+      .select('*')
+      .eq('status', 'active')
+      .order('rating', { ascending: false });
+
+    if (error) {
+      logger.warn('Database doctors query error:', error);
+    }
+
+    // If no doctors in database, return mock data
+    const mockDoctors = [
+      {
+        id: 1,
+        name: 'Dr. Sarah Johnson',
+        specialty: 'Obstetrician & Gynecologist',
+        experience: '12 years',
+        rating: 4.8,
+        image: 'https://images.unsplash.com/photo-1559839734-2b71ea197ec2?w=400&h=400&fit=crop&crop=face',
+        nextAvailable: 'Today, 2:00 PM',
+        consultationFee: '$75',
+        languages: ['English', 'Spanish']
+      },
+      {
+        id: 2,
+        name: 'Dr. Michael Chen',
+        specialty: 'Maternal-Fetal Medicine',
+        experience: '15 years',
+        rating: 4.9,
+        image: 'https://images.unsplash.com/photo-1612349317150-e413f6a5b16d?w=400&h=400&fit=crop&crop=face',
+        nextAvailable: 'Tomorrow, 10:00 AM',
+        consultationFee: '$85',
+        languages: ['English', 'Mandarin']
+      },
+      {
+        id: 3,
+        name: 'Dr. Emily Rodriguez',
+        specialty: 'High-Risk Pregnancy Specialist',
+        experience: '10 years',
+        rating: 4.7,
+        image: 'https://images.unsplash.com/photo-1594824949417-772a4935c7ad?w=400&h=400&fit=crop&crop=face',
+        nextAvailable: 'Today, 4:30 PM',
+        consultationFee: '$90',
+        languages: ['English', 'Spanish', 'French']
+      }
+    ];
+
+    auditLog('fetch_doctors', req.user.id, {
+      doctors_count: doctors?.length || mockDoctors.length,
+      source: doctors?.length ? 'database' : 'mock'
+    });
+
+    res.json({
+      doctors: doctors?.length ? doctors : mockDoctors,
+      source: doctors?.length ? 'database' : 'mock',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Doctors endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to fetch doctors',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+
+// Available slots endpoint (called by ConsultationScreen)
+router.get('/available-slots', async (req, res) => {
+  try {
+    const { doctorId, date } = req.query;
+
+    if (!doctorId || !date) {
+      return res.status(400).json({
+        error: 'Missing required parameters',
+        message: 'doctorId and date are required'
+      });
+    }
+
+    const supabase = getSupabaseClient();
+
+    // Try to fetch real availability from database
+    const { data: bookedSlots, error } = await supabase
+      .from('appointments')
+      .select('appointment_time')
+      .eq('healthcare_provider_id', doctorId)
+      .eq('appointment_date', date)
+      .eq('status', 'confirmed');
+
+    if (error) {
+      logger.warn('Database slots query error:', error);
+    }
+
+    // Generate available slots (9 AM to 5 PM, excluding booked slots)
+    const allSlots = [
+      '09:00 AM', '10:00 AM', '11:00 AM', '12:00 PM',
+      '01:00 PM', '02:00 PM', '03:00 PM', '04:00 PM', '05:00 PM'
+    ];
+
+    const bookedTimes = bookedSlots?.map(slot => slot.appointment_time) || [];
+    const availableSlots = allSlots.filter(slot => !bookedTimes.includes(slot));
+
+    // If it's today or past dates, remove morning slots
+    const selectedDate = new Date(date);
+    const today = new Date();
+    const isToday = selectedDate.toDateString() === today.toDateString();
+    
+    let filteredSlots = availableSlots;
+    if (isToday) {
+      const currentHour = today.getHours();
+      filteredSlots = availableSlots.filter(slot => {
+        const slotHour = parseInt(slot.split(':')[0]);
+        const isPM = slot.includes('PM');
+        const hour24 = isPM && slotHour !== 12 ? slotHour + 12 : slotHour;
+        return hour24 > currentHour;
+      });
+    }
+
+    auditLog('fetch_available_slots', req.user.id, {
+      doctor_id: doctorId,
+      date,
+      available_count: filteredSlots.length,
+      booked_count: bookedTimes.length
+    });
+
+    res.json({
+      slots: filteredSlots,
+      doctorId,
+      date,
+      totalSlots: allSlots.length,
+      bookedSlots: bookedTimes.length,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Available slots endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to fetch available slots',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+
+
+// Health tips by category endpoint (called by HealthTipsScreen)
+router.get('/category/:category', async (req, res) => {
+  try {
+    const { category } = req.params;
+    const supabase = getSupabaseClient();
+    const healthData = await getUserHealthData(req.user.id, supabase);
+
+    // Fetch tips for specific category
+    const healthTips = await fetchHealthTipsFromDatabase(
+      supabase, 
+      category, 
+      healthData?.gestationalWeek || 0, 
+      req.user.id
+    );
+
+    // If no tips found, use default tips for category
+    const finalTips = healthTips.length > 0 
+      ? healthTips 
+      : createDefaultHealthTips(category, healthData?.gestationalWeek || 0);
+
+    auditLog('fetch_category_tips', req.user.id, {
+      category,
+      tips_count: finalTips.length,
+      week: healthData?.gestationalWeek || 0
+    });
+
+    res.json({
+      healthTips: finalTips,
+      category,
+      gestationalWeek: healthData?.gestationalWeek || 0,
+      source: healthTips.length > 0 ? 'database' : 'default',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Category tips endpoint error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Unable to fetch category tips',
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Add CACHE_DURATION constant at the top of the file if not already defined
+const CACHE_DURATION = parseInt(process.env.CACHE_DURATION) || 3600; // 1 hour default
+
 // Helper function to create string hash
 String.prototype.hashCode = function() {
   let hash = 0;
