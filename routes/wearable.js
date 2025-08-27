@@ -7,14 +7,15 @@ const Joi = require('joi');
 const { getCached, setCached } = require('../config/cache');
 const axios = require('axios');
 
+const auditLog = logger.auditLog || ((action, userId, data) => {
+  logger.info(`Audit: ${action}`, { userId, ...data });
+});
 const router = express.Router();
-
-
 
 async function predictRisk(userProfile, wearableData) {
   try {
     const response = await axios.post(
-      process.env.XAI_API_URL || 'https://api.x.ai/v1/risk-assessment',
+      process.env.MATERNAL_HEALTH_API_URL || 'http://192.168.1.238:8000/risk-assessment',
       {
         user_profile: userProfile,
         wearable_data: wearableData,
@@ -35,7 +36,6 @@ router.post('/assess-risk', requireRole(['mother']), async (req, res) => {
   try {
     const supabase = getSupabaseClient();
     const cacheKey = `risk_assessment:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
-
     const cachedAssessment = await getCached(cacheKey);
     if (cachedAssessment) {
       return res.json(cachedAssessment);
@@ -60,31 +60,75 @@ router.post('/assess-risk', requireRole(['mother']), async (req, res) => {
       .limit(1)
       .single();
 
+    // Get user profile data for additional fields
+    const { data: userProfile } = await supabase
+      .from('users_profile')
+      .select('age, height, weight, medical_conditions')
+      .eq('id', req.user.id)
+      .single();
+
+    // Calculate gestational age in weeks - ensure minimum of 6
+    let gestationalAge = 20; // Default fallback
+    if (pregnancy.start_date) {
+      const calculatedWeeks = Math.floor((new Date() - new Date(pregnancy.start_date)) / (1000 * 60 * 60 * 24 * 7));
+      gestationalAge = Math.max(calculatedWeeks, 6); // Ensure minimum of 6 weeks
+    }
+
     const input = {
-      Age: req.user.age || 25,
-      SystolicBP: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[0]) : 120,
-      DiastolicBP: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[1]) : 80,
-      BS: req.user.medical_conditions?.includes('diabetes') ? 6.0 : 4.5,
-      BodyTemp: wearable?.temperature ? (wearable.temperature * 9/5 + 32) : 98.6,
-      HeartRate: wearable?.heart_rate || 80,
+      age: userProfile?.age || req.user.age || 25,
+      gestational_age: gestationalAge,
+      weight_pre_pregnancy: userProfile?.weight || req.user.weight || 65, // kg
+      height: userProfile?.height || req.user.height || 165, // cm
+      systolic_bp: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[0]) : 120,
+      diastolic_bp: wearable?.blood_pressure ? parseInt(wearable.blood_pressure.split('/')[1]) : 80,
+      heart_rate: wearable?.heart_rate || 80,
+      temperature: wearable?.temperature || 36.5, // Celsius
+      blood_sugar: wearable?.blood_sugar || (
+        (userProfile?.medical_conditions || req.user.medical_conditions)?.includes('diabetes') ? 6.0 : 4.5
+      )
     };
 
+    logger.info('Risk assessment input:', input);
+
     let riskLevel;
+    let source = 'rule-based';
+    
     try {
       const response = await axios.post(
-        process.env.MODEL_API_URL + '/risk-assessment',
+        process.env.MATERNAL_HEALTH_API_URL + '/risk-assessment',
         input,
-        { headers: { 'Content-Type': 'application/json' } }
+        { 
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 10000 // Add timeout
+        }
       );
       riskLevel = response.data.risk_level;
+      source = 'model';
     } catch (error) {
-      logger.error('Model API error:', error);
+      logger.error('Model API error:', {
+        message: error.message,
+        response: error.response?.data,
+        status: error.response?.status,
+        input: input
+      });
+      
+      // Improved rule-based fallback
       riskLevel = 'low';
-      if (input.HeartRate > 120 || input.HeartRate < 60 || input.SystolicBP > 140 || input.DiastolicBP > 90 || input.BodyTemp > 100.4) {
+      
+      // High risk conditions
+      if (input.heart_rate > 120 || input.heart_rate < 60 || 
+          input.systolic_bp > 140 || input.diastolic_bp > 90 || 
+          input.temperature > 38.0 || input.blood_sugar > 7.0) {
         riskLevel = 'high';
-      } else if (input.HeartRate > 100 || input.SystolicBP > 120 || input.BS > 5.5) {
+      } 
+      // Medium risk conditions
+      else if (input.heart_rate > 100 || input.heart_rate < 70 ||
+               input.systolic_bp > 130 || input.diastolic_bp > 85 || 
+               input.temperature > 37.5 || input.blood_sugar > 5.5) {
         riskLevel = 'medium';
       }
+      
+      source = 'rule-based';
     }
 
     const assessmentId = uuidv4();
@@ -95,7 +139,7 @@ router.post('/assess-risk', requireRole(['mother']), async (req, res) => {
           id: assessmentId,
           user_id: req.user.id,
           risk_level: riskLevel,
-          details: { model_input: input },
+          details: { model_input: input, source: source },
           created_at: new Date().toISOString(),
         },
       ]);
@@ -114,7 +158,7 @@ router.post('/assess-risk', requireRole(['mother']), async (req, res) => {
             id: alertId,
             user_id: req.user.id,
             type: 'high_risk',
-            message: `High risk detected: ${JSON.stringify(input)}`,
+            message: `High risk detected: Heart Rate ${input.heart_rate}, BP ${input.systolic_bp}/${input.diastolic_bp}, Temp ${input.temperature}°C`,
             triggered_at: new Date().toISOString(),
             resolved: false,
           },
@@ -125,24 +169,45 @@ router.post('/assess-risk', requireRole(['mother']), async (req, res) => {
       riskAssessment: {
         id: assessmentId,
         risk_level: riskLevel,
-        details: { model_input: input },
+        details: { model_input: input, source: source },
         created_at: new Date().toISOString(),
       },
-      source: riskLevel === (await axios.post(process.env.MODEL_API_URL + '/risk-assessment', input).catch(() => ({}))).data?.risk_level ? 'model' : 'rule-based',
+      source: source,
     };
 
     await setCached(cacheKey, response, 24 * 60 * 60);
-    auditLog('risk_assessment', req.user.id, { risk_level: riskLevel, source: response.source });
+    
+    try {
+      auditLog('risk_assessment', req.user.id, { risk_level: riskLevel, source: source });
+    } catch (auditError) {
+      logger.error('Audit log error:', auditError);
+    }
+    
     res.json(response);
   } catch (error) {
     logger.error('Risk assessment error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
 // Sync wearable data
+const wearableDataSchema = Joi.object({
+  heart_rate: Joi.number().min(30).max(200).optional(),
+  blood_pressure: Joi.string().pattern(/^\d{2,3}\/\d{2,3}$/).optional(),
+  blood_sugar: Joi.number().min(0).max(30).optional(),
+  temperature: Joi.number().min(35).max(42).optional(),
+  steps: Joi.number().integer().min(0).optional(),
+  timestamp: Joi.date().iso().optional(),
+}).min(1);
+
 router.post('/sync', requireRole(['mother']), async (req, res) => {
   try {
-    const { heart_rate, blood_pressure, temperature, steps, timestamp } = req.body;
+    const { error: validationError } = wearableDataSchema.validate(req.body);
+    if (validationError) {
+      return res.status(400).json({ error: 'Invalid wearable data', details: validationError.details });
+    }
+
+    const { heart_rate, blood_pressure, blood_sugar, temperature, steps, timestamp } = req.body;
     const supabase = getSupabaseClient();
 
     const wearableDataId = uuidv4();
@@ -154,6 +219,7 @@ router.post('/sync', requireRole(['mother']), async (req, res) => {
         timestamp: timestamp || new Date().toISOString(),
         heart_rate,
         blood_pressure,
+        blood_sugar,
         temperature,
         steps
       }])
@@ -194,7 +260,7 @@ router.get('/data', async (req, res) => {
 
     let selectFields = '*';
     if (type) {
-      const validTypes = ['heart_rate', 'blood_pressure', 'temperature', 'steps'];
+      const validTypes = ['heart_rate', 'blood_pressure', 'temperature', 'steps', 'blood_sugar'];
       if (validTypes.includes(type)) {
         selectFields = `id, user_id, timestamp, ${type}`;
       }
@@ -269,6 +335,7 @@ async function checkEmergencyConditions(userId, vitals) {
         user_id: userId,
         triggered_at: new Date().toISOString(),
         type: alert.type,
+        message: alert.message,
         resolved: false
       }]);
 
@@ -316,65 +383,18 @@ function calculateDataSummary(data, type) {
     }
   }
 
+  if (!type || type === 'blood_sugar') {
+    const bloodSugar = data.filter(d => d.blood_sugar).map(d => d.blood_sugar);
+    if (bloodSugar.length > 0) {
+      summary.blood_sugar = {
+        average: Math.round(bloodSugar.reduce((a, b) => a + b, 0) / bloodSugar.length * 10) / 10,
+        min: Math.min(...bloodSugar),
+        max: Math.max(...bloodSugar)
+      };
+    }
+  }
+
   return summary;
 }
-
-
-// routes/wearable.js (Modify POST /sync route)
-
-const wearableDataSchema = Joi.object({
-  heart_rate: Joi.number().min(30).max(200).optional(),
-  blood_pressure: Joi.string().pattern(/^\d{2,3}\/\d{2,3}$/).optional(),
-  temperature: Joi.number().min(35).max(42).optional(),
-  steps: Joi.number().integer().min(0).optional(),
-  timestamp: Joi.date().iso().optional(),
-}).min(1);
-
-router.post('/sync', requireRole(['mother']), async (req, res) => {
-  try {
-    const { error: validationError } = wearableDataSchema.validate(req.body);
-    if (validationError) {
-      return res.status(400).json({ error: 'Invalid wearable data', details: validationError.details });
-    }
-
-    const { heart_rate, blood_pressure, temperature, steps, timestamp } = req.body;
-    const supabase = getSupabaseClient();
-
-    const wearableDataId = uuidv4();
-    const { data: wearableData, error } = await supabase
-      .from('wearable_data')
-      .insert([{
-        id: wearableDataId,
-        user_id: req.user.id,
-        timestamp: timestamp || new Date().toISOString(),
-        heart_rate,
-        blood_pressure,
-        temperature,
-        steps
-      }])
-      .select()
-      .single();
-
-    if (error) {
-      logger.error('Wearable data sync error:', error);
-      return res.status(500).json({ error: 'Failed to sync wearable data' });
-    }
-
-    await checkEmergencyConditions(req.user.id, {
-      heart_rate,
-      blood_pressure,
-      temperature
-    });
-
-    res.status(201).json({
-      message: 'Wearable data synced successfully',
-      data: wearableData
-    });
-
-  } catch (error) {
-    logger.error('Sync wearable data error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 module.exports = router;

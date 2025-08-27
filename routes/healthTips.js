@@ -1,16 +1,56 @@
-// routes/healthTips.js - Debug and Enhanced Version
+// routes/healthTips.js - Fixed Version
 const { getSupabaseClient } = require('../config/database');
 const { getCached, setCached, deleteCached } = require('../config/cache');
 const logger = require('../utils/logger');
-const { auditLog } = require('../utils/logger');
+// Fix: Properly import auditLog - check if it's a separate export or part of logger
+const auditLog = logger.auditLog || ((action, userId, data) => {
+  logger.info(`Audit: ${action}`, { userId, ...data });
+});
 const axios = require('axios');
 
 const router = require('express').Router();
 
 // Configuration for maternal health API
-const MATERNAL_HEALTH_API_URL = process.env.MATERNAL_HEALTH_API_URL || 'http://localhost:8000';
-const API_TIMEOUT = parseInt(process.env.API_TIMEOUT) || 8000; // Increased timeout
+const MATERNAL_HEALTH_API_URL = process.env.MATERNAL_HEALTH_API_URL;
+const API_TIMEOUT = parseInt(process.env.API_TIMEOUT) || 8000;
 const DATABASE_FALLBACK_ENABLED = process.env.DATABASE_FALLBACK_ENABLED !== 'false';
+const CACHE_DURATION = parseInt(process.env.CACHE_DURATION) || 3600;
+
+// Helper function to safely calculate gestational week
+function calculateGestationalWeek(startDate) {
+  try {
+    if (!startDate) return 0;
+    
+    const start = new Date(startDate);
+    const current = new Date();
+    
+    // Validate dates
+    if (isNaN(start.getTime())) {
+      logger.warn('Invalid start date provided:', startDate);
+      return 0;
+    }
+    
+    const diffTime = current - start;
+    const diffWeeks = Math.floor(diffTime / (7 * 24 * 60 * 60 * 1000));
+    
+    // Ensure reasonable gestational week (0-42)
+    return Math.max(0, Math.min(42, diffWeeks));
+  } catch (error) {
+    logger.error('Error calculating gestational week:', error);
+    return 0;
+  }
+}
+
+// Helper function to safely parse numeric values
+function safeParseInt(value, defaultValue = 0) {
+  const parsed = parseInt(value);
+  return isNaN(parsed) ? defaultValue : parsed;
+}
+
+function safeParseFloat(value, defaultValue = 0.0) {
+  const parsed = parseFloat(value);
+  return isNaN(parsed) ? defaultValue : parsed;
+}
 
 // Helper function to get user's health data with better error handling
 async function getUserHealthData(userId, supabase) {
@@ -25,23 +65,24 @@ async function getUserHealthData(userId, supabase) {
       .eq('status', 'active')
       .single();
 
-    if (pregnancyError) {
+    if (pregnancyError && pregnancyError.code !== 'PGRST116') {
       logger.warn(`Pregnancy query error for user ${userId}:`, pregnancyError);
     }
 
     if (!pregnancy) {
       logger.warn(`No active pregnancy found for user ${userId}, using defaults`);
-      // Create default pregnancy data for demo/testing purposes
-      const defaultPregnancy = {
-        start_date: new Date(Date.now() - (12 * 7 * 24 * 60 * 60 * 1000)).toISOString(), // 12 weeks ago
-        due_date: new Date(Date.now() + (28 * 7 * 24 * 60 * 60 * 1000)).toISOString(), // 28 weeks from now
-        age_at_conception: 28
-      };
       
       // For production, you might want to throw an error here instead
       if (process.env.NODE_ENV === 'production') {
         throw new Error('No active pregnancy found');
       }
+      
+      // Create default pregnancy data for demo/testing purposes
+      const defaultPregnancy = {
+        start_date: new Date(Date.now() - (12 * 7 * 24 * 60 * 60 * 1000)).toISOString(),
+        due_date: new Date(Date.now() + (28 * 7 * 24 * 60 * 60 * 1000)).toISOString(),
+        age_at_conception: 28
+      };
       
       logger.info('Using default pregnancy data for development/testing');
       return {
@@ -53,19 +94,17 @@ async function getUserHealthData(userId, supabase) {
       };
     }
 
-    // Calculate gestational week
-    const startDate = new Date(pregnancy.start_date);
-    const currentDate = new Date();
-    const gestationalWeek = Math.max(0, Math.floor((currentDate - startDate) / (7 * 24 * 60 * 60 * 1000)));
+    // Calculate gestational week safely
+    const gestationalWeek = calculateGestationalWeek(pregnancy.start_date);
 
     // Get user profile with error handling
     const { data: profile, error: profileError } = await supabase
-      .from('user_profiles')
+      .from('users_profile')
       .select('age, bmi, medical_conditions, previous_pregnancies')
       .eq('user_id', userId)
       .single();
 
-    if (profileError) {
+    if (profileError && profileError.code !== 'PGRST116') {
       logger.warn(`Profile query error for user ${userId}:`, profileError);
     }
 
@@ -78,16 +117,15 @@ async function getUserHealthData(userId, supabase) {
       .limit(1)
       .single();
 
-    if (wearableError && wearableError.code !== 'PGRST116') { // PGRST116 = no rows returned
+    if (wearableError && wearableError.code !== 'PGRST116') {
       logger.warn(`Wearable data query error for user ${userId}:`, wearableError);
     }
 
     // Get weight tracking data
     const { data: weightData, error: weightError } = await supabase
-      .from('weight_tracking')
-      .select('weight_gain')
+      .from('users_profile')
+      .select('weight')
       .eq('user_id', userId)
-      .order('recorded_at', { ascending: false })
       .limit(1)
       .single();
 
@@ -120,15 +158,22 @@ async function getUserHealthData(userId, supabase) {
 // Enhanced function to fetch health tips from database with better fallbacks
 async function fetchHealthTipsFromDatabase(supabase, category, gestationalWeek, userId) {
   try {
-    logger.info(`Fetching health tips from database:`, { category, gestationalWeek, userId });
+    // Ensure gestationalWeek is a valid number
+    const safeGestationalWeek = safeParseInt(gestationalWeek, 0);
+    
+    logger.info(`Fetching health tips from database:`, { 
+      category, 
+      gestationalWeek: safeGestationalWeek, 
+      userId 
+    });
 
     // First try: exact week match
     let { data: healthTips, error } = await supabase
       .from('health_tips')
       .select('*')
       .eq('category', category)
-      .lte('week_start', Math.max(0, gestationalWeek))
-      .gte('week_end', Math.max(0, gestationalWeek))
+      .lte('week_start', safeGestationalWeek)
+      .gte('week_end', safeGestationalWeek)
       .order('created_at', { ascending: false })
       .limit(10);
 
@@ -139,7 +184,7 @@ async function fetchHealthTipsFromDatabase(supabase, category, gestationalWeek, 
 
     // If no tips found for exact week, try broader range
     if (!healthTips || healthTips.length === 0) {
-      logger.info(`No tips found for exact week ${gestationalWeek}, trying broader range`);
+      logger.info(`No tips found for exact week ${safeGestationalWeek}, trying broader range`);
       
       const { data: broadTips, error: broadError } = await supabase
         .from('health_tips')
@@ -192,7 +237,7 @@ async function fetchHealthTipsFromDatabase(supabase, category, gestationalWeek, 
 
     logger.info(`Database tips fetched:`, {
       category,
-      gestationalWeek,
+      gestationalWeek: safeGestationalWeek,
       tipsFound: (healthTips || []).length,
       userId
     });
@@ -293,7 +338,7 @@ function createDefaultHealthTips(category, gestationalWeek) {
   return defaultTips[category] || defaultTips.general;
 }
 
-// Helper function to prepare maternal health input (unchanged)
+// Helper function to prepare maternal health input
 function prepareMaternalHealthInput(healthData) {
   const { pregnancy, profile, wearable, weightData, gestationalWeek } = healthData;
   
@@ -302,15 +347,15 @@ function prepareMaternalHealthInput(healthData) {
   if (wearable?.blood_pressure) {
     const bpParts = wearable.blood_pressure.split('/');
     if (bpParts.length === 2) {
-      systolicBP = parseInt(bpParts[0]) || 120;
-      diastolicBP = parseInt(bpParts[1]) || 80;
+      systolicBP = safeParseInt(bpParts[0], 120);
+      diastolicBP = safeParseInt(bpParts[1], 80);
     }
   }
 
   // Convert temperature to Fahrenheit if needed
   let bodyTemp = 98.6;
   if (wearable?.temperature) {
-    bodyTemp = wearable.temperature;
+    bodyTemp = safeParseFloat(wearable.temperature, 98.6);
     // Assume Celsius if temperature is below 50, convert to Fahrenheit
     if (bodyTemp < 50) {
       bodyTemp = (bodyTemp * 9/5) + 32;
@@ -320,24 +365,68 @@ function prepareMaternalHealthInput(healthData) {
   // Estimate blood sugar based on conditions
   let bloodSugar = 95.0;
   if (wearable?.blood_sugar) {
-    bloodSugar = parseFloat(wearable.blood_sugar);
+    bloodSugar = safeParseFloat(wearable.blood_sugar, 95.0);
   } else if (profile?.medical_conditions?.includes('diabetes') || 
              profile?.medical_conditions?.includes('gestational_diabetes')) {
-    bloodSugar = 130.0; // Higher estimate for diabetic patients
+    bloodSugar = 130.0;
   }
 
+  // Ensure gestational week is valid
+  const safeGestationalWeek = safeParseInt(gestationalWeek, 12);
+
   return {
-    age: profile?.age || pregnancy?.age_at_conception || 28,
-    gestational_week: Math.min(42, Math.max(12, gestationalWeek + 12)), // Convert to pregnancy weeks (12-42)
+    age: safeParseInt(profile?.age || pregnancy?.age_at_conception, 28),
+    gestational_week: Math.min(42, Math.max(12, safeGestationalWeek + 12)),
     systolic_bp: Math.max(80, Math.min(200, systolicBP)),
     diastolic_bp: Math.max(50, Math.min(120, diastolicBP)),
     blood_sugar: Math.max(60, Math.min(250, bloodSugar)),
     body_temp: Math.max(96, Math.min(104, bodyTemp)),
-    heart_rate: Math.max(50, Math.min(150, wearable?.heart_rate || 85)),
-    bmi: Math.max(15, Math.min(50, profile?.bmi || 24)),
-    previous_pregnancies: Math.max(0, Math.min(10, profile?.previous_pregnancies || 0)),
-    weight_gain: Math.max(-20, Math.min(80, weightData?.weight_gain || 25))
+    heart_rate: Math.max(50, Math.min(150, safeParseInt(wearable?.heart_rate, 85))),
+    bmi: Math.max(15, Math.min(50, safeParseFloat(profile?.bmi, 24))),
+    previous_pregnancies: Math.max(0, Math.min(10, safeParseInt(profile?.previous_pregnancies, 0))),
+    weight_gain: Math.max(-20, Math.min(80, safeParseFloat(weightData?.weight_gain, 25)))
   };
+}
+
+// Helper function for simple risk assessment
+function simpleRiskAssessment(healthData) {
+  const bmi = healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2);
+  let riskLevel = 'Low';
+  const riskFactors = [];
+
+  if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
+    riskLevel = 'Medium';
+    riskFactors.push('elevated blood pressure');
+  }
+  if (bmi > 30 || bmi < 18.5) {
+    riskLevel = 'Medium';
+    riskFactors.push('BMI concerns');
+  }
+  if (healthData.gestational_age > 37) {
+    riskLevel = 'Medium';
+    riskFactors.push('advanced gestational age');
+  }
+  if (healthData.age > 35) {
+    riskLevel = 'Medium';
+    riskFactors.push('advanced maternal age');
+  }
+
+  if (riskFactors.length > 2) {
+    riskLevel = 'High';
+  }
+
+  return { riskLevel, riskFactors, bmi };
+}
+
+// Helper function to create string hash
+function hashCode(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    const char = str.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return hash;
 }
 
 // Main health tips endpoint - Enhanced with better fallbacks
@@ -377,7 +466,7 @@ router.get('/', async (req, res) => {
     let apiErrors = [];
 
     // Only try AI APIs if URL is properly configured
-    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL !== 'http://localhost:8000') {
+    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL) {
       try {
         logger.info(`Attempting AI API calls to ${MATERNAL_HEALTH_API_URL} with timeout ${API_TIMEOUT}ms`);
         
@@ -617,81 +706,6 @@ router.get('/', async (req, res) => {
   }
 });
 
-// Add a debug endpoint to check database health tips
-router.get('/debug/database-tips', async (req, res) => {
-  try {
-    const supabase = getSupabaseClient();
-    
-    // Get count of tips by category
-    const { data: tipCounts, error } = await supabase
-      .from('health_tips')
-      .select('category, id')
-      .order('category');
-
-    if (error) {
-      return res.status(500).json({ error: error.message });
-    }
-
-    const categoryCounts = {};
-    (tipCounts || []).forEach(tip => {
-      categoryCounts[tip.category] = (categoryCounts[tip.category] || 0) + 1;
-    });
-
-    // Get sample tips from each category
-    const sampleTips = {};
-    for (const category of ['general', 'nutrition', 'exercise', 'mental_health']) {
-      const { data: samples } = await supabase
-        .from('health_tips')
-        .select('id, title, content, week_start, week_end')
-        .eq('category', category)
-        .limit(2);
-      
-      sampleTips[category] = samples || [];
-    }
-
-    res.json({
-      totalTips: (tipCounts || []).length,
-      categoryCounts,
-      sampleTips,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    logger.error('Debug database tips error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Add endpoint to clear cache for specific user
-router.delete('/cache/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const today = new Date().toISOString().split('T')[0];
-    
-    const cacheKeys = [
-      `health_tips_v3:${userId}:${today}`,
-      `assessment:${userId}:${today}`,
-      `health_tips_v2:${userId}:${today}` // Legacy key
-    ];
-
-    for (const key of cacheKeys) {
-      await deleteCached(key);
-    }
-
-    logger.info(`Cache cleared for user ${userId}`);
-    res.json({ 
-      message: `Cache cleared for user ${userId}`,
-      keysCleared: cacheKeys,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    logger.error('Clear user cache error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-
 // Input validation middleware
 const validateBasicHealthInput = (req, res, next) => {
   const requiredFields = ['age', 'gestational_age', 'weight_pre_pregnancy', 'height', 'systolic_bp', 'diastolic_bp'];
@@ -765,12 +779,10 @@ const validateIntegratedConsultationInput = (req, res, next) => {
 };
 
 const validateComprehensiveHealthInput = (req, res, next) => {
-  // More comprehensive validation could include additional fields like heart_rate, blood_sugar, etc.
   validateBasicHealthInput(req, res, next);
 };
 
 const validateAdminAuth = (req, res, next) => {
-  // Simplified admin authentication check
   const authHeader = req.headers['authorization'];
   if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_TOKEN}`) {
     return res.status(403).json({
@@ -782,59 +794,11 @@ const validateAdminAuth = (req, res, next) => {
   next();
 };
 
-// Helper function to get user health data
-async function getUserHealthData(userId, supabase) {
-  try {
-    const { data: pregnancy, error: pregnancyError } = await supabase
-      .from('pregnancies')
-      .select('start_date, due_date, age_at_conception')
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .single();
-
-    if (pregnancyError) {
-      logger.warn(`Pregnancy query error for user ${userId}:`, pregnancyError);
-      return null;
-    }
-
-    return pregnancy;
-  } catch (error) {
-    logger.error('Error fetching user health data:', error);
-    return null;
-  }
-}
-
-// Helper function for simple risk assessment
-function simpleRiskAssessment(healthData) {
-  const bmi = healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2);
-  let riskLevel = 'Low';
-  const riskFactors = [];
-
-  if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
-    riskLevel = 'Medium';
-    riskFactors.push('elevated blood pressure');
-  }
-  if (bmi > 30 || bmi < 18.5) {
-    riskLevel = 'Medium';
-    riskFactors.push('BMI concerns');
-  }
-  if (healthData.gestational_age > 37) {
-    riskLevel = 'Medium';
-    riskFactors.push('advanced gestational age');
-  }
-  if (healthData.age > 35) {
-    riskLevel = 'Medium';
-    riskFactors.push('advanced maternal age');
-  }
-
-  return { riskLevel, riskFactors, bmi };
-}
-
 // Prediction Endpoints
 router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `predict:${JSON.stringify(healthData).hashCode()}`;
+    const cacheKey = `predict:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -886,7 +850,7 @@ router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
 router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `predict_simple:${JSON.stringify(healthData).hashCode()}`;
+    const cacheKey = `predict_simple:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -938,7 +902,7 @@ router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
 router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `risk_assessment:${JSON.stringify(healthData).hashCode()}`;
+    const cacheKey = `risk_assessment:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -987,93 +951,11 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
   }
 });
 
-router.post('/health-tips', validateBasicHealthInput, async (req, res) => {
-  try {
-    const healthData = req.body;
-    const cacheKey = `health_tips:${JSON.stringify(healthData).hashCode()}`;
-    
-    const cachedResponse = await getCached(cacheKey);
-    if (cachedResponse) {
-      logger.info(`Returning cached health tips`);
-      return res.json({ ...cachedResponse, fromCache: true });
-    }
-
-    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
-    
-    // Determine category based on health data
-    let category = 'general';
-    if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
-      category = 'mental_health';
-    } else if (bmi > 30 || bmi < 18.5) {
-      category = 'nutrition';
-    } else if (healthData.gestational_age > 30) {
-      category = 'exercise';
-    }
-
-    const tips = {
-      general: [
-        'Maintain regular prenatal checkups',
-        'Stay hydrated with 8-10 glasses of water daily',
-        'Take prenatal vitamins as prescribed'
-      ],
-      nutrition: [
-        'Focus on folate-rich foods like leafy greens',
-        'Choose whole grains for sustained energy',
-        'Limit processed foods and added sugars'
-      ],
-      exercise: [
-        'Engage in 20-30 minutes of moderate exercise daily',
-        'Try prenatal yoga for flexibility and relaxation',
-        'Avoid high-risk activities'
-      ],
-      mental_health: [
-        'Practice deep breathing exercises',
-        'Connect with support groups or family',
-        'Consider professional support if feeling overwhelmed'
-      ]
-    };
-
-    const response = {
-      health_tips: {
-        category,
-        tips: tips[category],
-        confidence: 0.70,
-        sources: ['rule_based_recommendations'],
-        health_metrics: {
-          bmi: bmi.toFixed(1),
-          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
-          gestational_age: healthData.gestational_age
-        }
-      },
-      timestamp: new Date().toISOString(),
-      fromCache: false
-    };
-
-    await setCached(cacheKey, response, CACHE_DURATION);
-    
-    auditLog('health_tips', null, {
-      category,
-      tips_count: tips[category].length,
-      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
-    });
-
-    res.json(response);
-  } catch (error) {
-    logger.error('Health tips endpoint error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Unable to process health tips request',
-      timestamp: new Date().toISOString(),
-      requestId: req.headers['x-request-id'] || 'unknown'
-    });
-  }
-});
-
 // Chat Endpoints
 router.post('/chat', validateChatInput, async (req, res) => {
   try {
     const { message, user_id } = req.body;
-    const cacheKey = `chat:${user_id}:${message.hashCode()}`;
+    const cacheKey = `chat:${user_id}:${hashCode(message)}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -1138,7 +1020,7 @@ router.post('/chat', validateChatInput, async (req, res) => {
 router.post('/integrated-consultation', validateIntegratedConsultationInput, async (req, res) => {
   try {
     const { message, user_id, health_data } = req.body;
-    const cacheKey = `integrated_consultation:${user_id}:${message.hashCode()}:${JSON.stringify(health_data).hashCode()}`;
+    const cacheKey = `integrated_consultation:${user_id}:${hashCode(message)}:${hashCode(JSON.stringify(health_data))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -1211,7 +1093,7 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
 router.post('/health-report', validateComprehensiveHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `health_report:${JSON.stringify(healthData).hashCode()}`;
+    const cacheKey = `health_report:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -1264,9 +1146,6 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
   }
 });
 
-
-// Add these endpoints to your existing healthTips.js router
-
 // Health Assessment endpoint (called by HealthAssessmentScreen)
 router.get('/health-assessment', async (req, res) => {
   try {
@@ -1292,7 +1171,7 @@ router.get('/health-assessment', async (req, res) => {
     let dataSource = 'rule-based';
 
     // Try AI APIs if configured
-    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL !== 'http://localhost:8000') {
+    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL) {
       try {
         const [tipsResponse, riskResponse] = await Promise.allSettled([
           axios.post(`${MATERNAL_HEALTH_API_URL}/health-tips`, maternalInput, {
@@ -1326,8 +1205,8 @@ router.get('/health-assessment', async (req, res) => {
       const { riskLevel, riskFactors } = simpleRiskAssessment({
         age: maternalInput.age,
         gestational_age: maternalInput.gestational_week - 12,
-        weight_pre_pregnancy: 65, // Default estimate
-        height: 165, // Default estimate
+        weight_pre_pregnancy: 65,
+        height: 165,
         systolic_bp: maternalInput.systolic_bp,
         diastolic_bp: maternalInput.diastolic_bp
       });
@@ -1562,7 +1441,6 @@ router.get('/doctors', async (req, res) => {
   }
 });
 
-
 // Available slots endpoint (called by ConsultationScreen)
 router.get('/available-slots', async (req, res) => {
   try {
@@ -1640,8 +1518,6 @@ router.get('/available-slots', async (req, res) => {
   }
 });
 
-
-
 // Health tips by category endpoint (called by HealthTipsScreen)
 router.get('/category/:category', async (req, res) => {
   try {
@@ -1686,18 +1562,78 @@ router.get('/category/:category', async (req, res) => {
   }
 });
 
-// Add CACHE_DURATION constant at the top of the file if not already defined
-const CACHE_DURATION = parseInt(process.env.CACHE_DURATION) || 3600; // 1 hour default
+// Add a debug endpoint to check database health tips
+router.get('/debug/database-tips', async (req, res) => {
+  try {
+    const supabase = getSupabaseClient();
+    
+    // Get count of tips by category
+    const { data: tipCounts, error } = await supabase
+      .from('health_tips')
+      .select('category, id')
+      .order('category');
 
-// Helper function to create string hash
-String.prototype.hashCode = function() {
-  let hash = 0;
-  for (let i = 0; i < this.length; i++) {
-    const char = this.charCodeAt(i);
-    hash = ((hash << 5) - hash) + char;
-    hash = hash & hash;
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const categoryCounts = {};
+    (tipCounts || []).forEach(tip => {
+      categoryCounts[tip.category] = (categoryCounts[tip.category] || 0) + 1;
+    });
+
+    // Get sample tips from each category
+    const sampleTips = {};
+    for (const category of ['general', 'nutrition', 'exercise', 'mental_health']) {
+      const { data: samples } = await supabase
+        .from('health_tips')
+        .select('id, title, content, week_start, week_end')
+        .eq('category', category)
+        .limit(2);
+      
+      sampleTips[category] = samples || [];
+    }
+
+    res.json({
+      totalTips: (tipCounts || []).length,
+      categoryCounts,
+      sampleTips,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Debug database tips error:', error);
+    res.status(500).json({ error: error.message });
   }
-  return hash;
-};
+});
+
+// Add endpoint to clear cache for specific user
+router.delete('/cache/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const today = new Date().toISOString().split('T')[0];
+    
+    const cacheKeys = [
+      `health_tips_v3:${userId}:${today}`,
+      `assessment:${userId}:${today}`,
+      `health_tips_v2:${userId}:${today}` // Legacy key
+    ];
+
+    for (const key of cacheKeys) {
+      await deleteCached(key);
+    }
+
+    logger.info(`Cache cleared for user ${userId}`);
+    res.json({ 
+      message: `Cache cleared for user ${userId}`,
+      keysCleared: cacheKeys,
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Clear user cache error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 
 module.exports = router;
