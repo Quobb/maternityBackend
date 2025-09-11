@@ -63,7 +63,7 @@ async function getUserHealthData(userId, supabase) {
     // Get pregnancy information
     const { data: pregnancy, error: pregnancyError } = await supabase
       .from('pregnancies')
-      .select('start_date, due_date, age_at_conception')
+      .select('start_date, due_date')
       .eq('user_id', userId)
       .eq('status', 'active')
       .single();
@@ -429,7 +429,7 @@ Focus on practical, safe recommendations appropriate for pregnancy. Always inclu
           content: prompt
         }
       ],
-      model: "llama3-8b-8192",
+      model: "llama-3.3-70b-versatile",
       temperature: 0.3,
       max_tokens: 500
     });
@@ -490,7 +490,7 @@ Base assessment on standard obstetric guidelines. Always recommend consulting he
           content: prompt
         }
       ],
-      model: "llama3-8b-8192",
+      model: "llama-3.3-70b-versatile",
       temperature: 0.2,
       max_tokens: 400
     });
@@ -981,35 +981,43 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
 // Enhanced Chat Endpoint with Groq
 router.post("/chat", async (req, res) => {
   try {
-    const { message, user_id } = req.body;
+    const { message, user_id, chatHistory = [] } = req.body;
 
     if (!message) {
       return res.status(400).json({
-        error: 'Invalid input',
-        message: 'Message is required',
-        timestamp: new Date().toISOString()
+        error: "Invalid input",
+        message: "Message is required",
+        timestamp: new Date().toISOString(),
       });
     }
 
-    // Get user context if user_id is provided
-    let userContext = '';
+    // Get user context (biodata) if user_id is provided
+    let userContext = "";
     if (user_id) {
       try {
         const supabase = getSupabaseClient();
-        const healthData = await getUserHealthData(user_id, supabase);
-        if (healthData && healthData.gestationalWeek) {
-          userContext = `\n\nUser Context: Currently at ${healthData.gestationalWeek} weeks of pregnancy.`;
+        const healthData = await getUserHealthData(req.user.id, supabase);
+
+        if (healthData) {
+          userContext = `
+User biodata:
+- Age: ${healthData.age || "N/A"}
+- Gestational week: ${healthData.gestationalWeek || "N/A"}
+- Weight: ${healthData.weight || "N/A"} kg
+- Symptoms: ${(healthData.symptoms || []).join(", ") || "None"}
+- History: ${(healthData.history || []).join(", ") || "None"}
+          `;
         }
       } catch (error) {
-        logger.warn('Could not fetch user context for chat:', error);
+        logger.warn("Could not fetch user context for chat:", error);
       }
     }
 
-    const chatCompletion = await groq.chat.completions.create({
-      messages: [
-        {
-          role: "system",
-          content: `You are a maternal health assistant specializing in pregnancy care and support. 
+    // Build conversation history
+    const conversationMessages = [
+      {
+        role: "system",
+        content: `You are a maternal health assistant specializing in pregnancy care and support. 
 
 Guidelines:
 - Only discuss pregnancy, maternal care, childbirth, and related health topics
@@ -1017,54 +1025,64 @@ Guidelines:
 - Provide evidence-based, safe information
 - Be empathetic and supportive while maintaining professional boundaries
 - If asked about non-pregnancy topics, politely redirect to pregnancy-related matters
-- Keep responses concise but informative (2-3 paragraphs max)
+- Keep responses concise but informative (2–3 paragraphs max)
 - Always encourage regular prenatal care
 
-${userContext}`
-        },
-        { role: "user", content: message },
-      ],
-      model: "llama3-8b-8192",
-      temperature: 0.7,
-      max_tokens: 500
+${userContext}`,
+      },
+      // Include prior conversation (if provided by frontend)
+      ...chatHistory.map((m) => ({
+        role: m.type === "user" ? "user" : "assistant",
+        content: m.content,
+      })),
+      { role: "user", content: message },
+    ];
+
+    // Call Groq
+    const chatCompletion = await groq.chat.completions.create({
+      messages: conversationMessages,
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.9, // a bit higher for more variation
+      max_tokens: 700,
     });
 
     const reply = chatCompletion.choices[0]?.message?.content;
 
     if (!reply) {
-      throw new Error('No response generated');
+      throw new Error("No response generated");
     }
 
     // Audit log
     if (user_id) {
-      auditLog('chat_groq', user_id, {
+      auditLog("chat_groq", user_id, {
         message_length: message.length,
         response_length: reply.length,
-        has_user_context: !!userContext
+        has_user_context: !!userContext,
+        history_length: chatHistory.length,
       });
     }
 
-    res.json({ 
+    res.json({
       reply,
       timestamp: new Date().toISOString(),
-      source: 'groq-ai'
+      source: "groq-ai",
     });
-
   } catch (err) {
-    logger.error('Chat endpoint error:', err);
-    res.status(500).json({ 
-      error: 'Unable to process chat request',
+    logger.error("Chat endpoint error:", err);
+    res.status(500).json({
+      error: "Unable to process chat request",
       message: err.message,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     });
   }
 });
 
+
 router.post('/integrated-consultation', validateIntegratedConsultationInput, async (req, res) => {
   try {
-    const { message, user_id, health_data } = req.body;
+    const { message, user_id, health_data, chatHistory = [] } = req.body;
+
     const cacheKey = `integrated_consultation_groq:${user_id}:${hashCode(message)}:${hashCode(JSON.stringify(health_data))}`;
-    
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
       logger.info(`Returning cached integrated consultation for user ${user_id}`);
@@ -1072,10 +1090,11 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
     }
 
     const supabase = getSupabaseClient();
-    const pregnancyData = await getUserHealthData(user_id, supabase);
+    const pregnancyData = await getUserHealthData(req.user.id, supabase);
+
     const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(health_data);
 
-    // Prepare detailed health context for Groq
+    // Build structured patient context
     const healthContext = `
 Patient Health Data:
 - Age: ${health_data.age} years
@@ -1083,7 +1102,7 @@ Patient Health Data:
 - Blood Pressure: ${health_data.systolic_bp}/${health_data.diastolic_bp} mmHg
 - BMI: ${bmi.toFixed(1)}
 - Risk Level: ${riskLevel}
-- Risk Factors: ${riskFactors.join(', ') || 'None identified'}
+- Risk Factors: ${riskFactors.join(', ') || 'None'}
 
 Patient Question: ${message}
     `;
@@ -1094,34 +1113,39 @@ Patient Question: ${message}
         messages: [
           {
             role: "system",
-            content: `You are a maternal health AI assistant providing consultation based on health data and patient questions.
+            content: `You are a maternal health AI assistant providing integrated consultation.
 
 Guidelines:
-- Analyze the provided health data in context of the patient's question
-- Provide personalized, evidence-based guidance
-- Always emphasize consulting healthcare providers for concerning symptoms
+- Analyze patient health data in context of their question
+- Use conversation history if provided to maintain continuity
+- Provide evidence-based, pregnancy-safe guidance
 - Be empathetic and supportive
-- Keep responses focused and actionable (2-3 paragraphs)
-- Include specific recommendations based on risk factors if any
-- Always include medical disclaimer`
+- Emphasize professional medical consultation when risk factors are present
+- Keep answers focused and actionable (2–3 paragraphs)
+- Always include a disclaimer: "This is not medical advice. Please consult your healthcare provider."`
           },
+          // Inject previous history
+          ...chatHistory.map(m => ({
+            role: m.type === "user" ? "user" : "assistant",
+            content: m.content,
+          })),
           { role: "user", content: healthContext }
         ],
-        model: "llama3-8b-8192",
-        temperature: 0.6,
-        max_tokens: 600
+        model: "llama-3.3-70b-versatile",
+        temperature: 0.75,
+        max_tokens: 700
       });
 
       groqResponse = consultation.choices[0]?.message?.content;
     } catch (error) {
-      logger.warn('Groq consultation failed:', error);
+      logger.warn("Groq consultation failed:", error);
     }
 
     let responseContent;
     if (groqResponse) {
       responseContent = {
         message: groqResponse,
-        confidence: 0.8,
+        confidence: 0.85,
         sources: ['groq-ai', 'provided_health_data'],
         health_metrics: {
           bmi: bmi.toFixed(1),
@@ -1131,11 +1155,13 @@ Guidelines:
         timestamp: new Date().toISOString()
       };
     } else {
-      // Fallback response
+      // Fallback: rule-based assessment
       responseContent = {
-        message: `Based on your health data (BP: ${health_data.systolic_bp}/${health_data.diastolic_bp}, BMI: ${bmi.toFixed(1)}), your risk level is ${riskLevel}. ${riskFactors.length > 0 ? 'Areas of concern: ' + riskFactors.join(', ') + '. Please discuss these with your healthcare provider.' : 'No immediate concerns detected, but regular checkups are recommended.'} 
-
-Please consult your healthcare provider for personalized medical advice regarding your specific question.`,
+        message: `Based on your health data (BP: ${health_data.systolic_bp}/${health_data.diastolic_bp}, BMI: ${bmi.toFixed(1)}), your risk level is ${riskLevel}. ${
+          riskFactors.length > 0 
+            ? 'Areas of concern: ' + riskFactors.join(', ') + '. Please discuss these with your healthcare provider.' 
+            : 'No immediate concerns detected, but regular prenatal checkups are recommended.'
+        }\n\nThis is not medical advice. Please consult your healthcare provider.`,
         confidence: 0.7,
         sources: ['rule_based_assessment', 'provided_health_data'],
         health_metrics: {
@@ -1158,13 +1184,14 @@ Please consult your healthcare provider for personalized medical advice regardin
     };
 
     await setCached(cacheKey, response, CACHE_DURATION);
-    
+
     auditLog('integrated_consultation', user_id, {
       message,
       risk_level: riskLevel,
       risk_factors_count: riskFactors.length,
       has_pregnancy: !!pregnancyData,
-      data_source: response.dataSource
+      data_source: response.dataSource,
+      history_length: chatHistory.length
     });
 
     res.json(response);
@@ -1178,6 +1205,7 @@ Please consult your healthcare provider for personalized medical advice regardin
     });
   }
 });
+
 
 // Report Endpoints - Updated with Groq
 router.post('/health-report', validateComprehensiveHealthInput, async (req, res) => {
@@ -1221,7 +1249,7 @@ Provide a JSON response with:
           },
           { role: "user", content: reportPrompt }
         ],
-        model: "llama3-8b-8192",
+        model: "llama-3.3-70b-versatile",
         temperature: 0.3,
         max_tokens: 500
       });
@@ -1596,7 +1624,7 @@ router.get('/doctors', async (req, res) => {
 // Health tips by category endpoint (called by HealthTipsScreen)
 router.get('/category/:category', async (req, res) => {
   try {
-    const { category } = req.params;
+    const { category } = req.user.id;
     const supabase = getSupabaseClient();
     const healthData = await getUserHealthData(req.user.id, supabase);
 
@@ -1685,7 +1713,7 @@ router.get('/debug/database-tips', async (req, res) => {
 // Add endpoint to clear cache for specific user
 router.delete('/cache/:userId', async (req, res) => {
   try {
-    const { userId } = req.params;
+    const { userId } = req.user.id;
     const today = new Date().toISOString().split('T')[0];
     
     const cacheKeys = [
@@ -1734,7 +1762,7 @@ router.get('/debug/groq-test', async (req, res) => {
           content: "Test connection"
         }
       ],
-      model: "llama3-8b-8192",
+      model: "llama-3.3-70b-versatile",
       max_tokens: 50
     });
 
@@ -1743,7 +1771,7 @@ router.get('/debug/groq-test', async (req, res) => {
     res.json({
       status: 'success',
       response,
-      model: 'llama3-8b-8192',
+      model: 'llama-3.3-70b-versatile',
       timestamp: new Date().toISOString()
     });
 
