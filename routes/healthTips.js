@@ -1,14 +1,16 @@
 // routes/healthTips.js - Groq Integration Version
-const { getSupabaseClient } = require('../config/database');
+const express = require('express');
 const { getCached, setCached, deleteCached } = require('../config/cache');
+const { getSupabaseClient } = require('../config/database');
 const logger = require('../utils/logger');
-import Groq from "groq-sdk";
+const Groq = require("groq-sdk");
+
 // Fix: Properly import auditLog - check if it's a separate export or part of logger
 const auditLog = logger.auditLog || ((action, userId, data) => {
   logger.info(`Audit: ${action}`, { userId, ...data });
 });
 
-const router = require('express').Router();
+const router = express.Router();
 
 // Initialize Groq client
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -899,146 +901,6 @@ const validateComprehensiveHealthInput = (req, res, next) => {
   validateBasicHealthInput(req, res, next);
 };
 
-const validateAdminAuth = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  if (!authHeader || authHeader !== `Bearer ${process.env.ADMIN_TOKEN}`) {
-    return res.status(403).json({
-      error: 'Unauthorized',
-      message: 'Admin access required',
-      timestamp: new Date().toISOString()
-    });
-  }
-  next();
-};
-
-// Prediction Endpoints - Updated to use Groq
-router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
-  try {
-    const healthData = req.body;
-    const cacheKey = `predict_groq:${hashCode(JSON.stringify(healthData))}`;
-    
-    const cachedResponse = await getCached(cacheKey);
-    if (cachedResponse) {
-      logger.info(`Returning cached comprehensive prediction`);
-      return res.json({ ...cachedResponse, fromCache: true });
-    }
-
-    // Try Groq AI first
-    const maternalInput = {
-      age: healthData.age,
-      gestational_week: healthData.gestational_age,
-      systolic_bp: healthData.systolic_bp,
-      diastolic_bp: healthData.diastolic_bp,
-      bmi: healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2),
-      heart_rate: healthData.heart_rate || 80,
-      blood_sugar: healthData.blood_sugar || 95,
-      body_temp: healthData.body_temp || 98.6,
-      previous_pregnancies: healthData.previous_pregnancies || 0,
-      weight_gain: healthData.weight_gain || 25
-    };
-
-    let groqPrediction = null;
-    try {
-      groqPrediction = await getGroqRiskAssessment(maternalInput);
-    } catch (error) {
-      logger.warn('Groq prediction failed, using fallback:', error);
-    }
-
-    // Fallback to simple assessment if Groq fails
-    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
-
-    const response = {
-      prediction: groqPrediction || {
-        risk_level: riskLevel,
-        risk_factors: riskFactors,
-        recommendation: riskFactors.length > 0 
-          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
-          : 'Continue with regular prenatal care',
-        confidence: 0.75,
-        sources: ['rule_based_prediction', 'health_data'],
-        health_metrics: {
-          bmi: bmi.toFixed(1),
-          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
-          gestational_age: healthData.gestational_age
-        }
-      },
-      dataSource: groqPrediction ? 'groq-ai' : 'rule-based',
-      timestamp: new Date().toISOString(),
-      fromCache: false
-    };
-
-    await setCached(cacheKey, response, CACHE_DURATION);
-    
-    auditLog('predict_comprehensive', null, {
-      risk_level: response.prediction.risk_level,
-      risk_factors_count: (response.prediction.risk_factors || []).length,
-      data_source: response.dataSource,
-      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
-    });
-
-    res.json(response);
-  } catch (error) {
-    logger.error('Predict endpoint error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Unable to process prediction request',
-      timestamp: new Date().toISOString(),
-      requestId: req.headers['x-request-id'] || 'unknown'
-    });
-  }
-});
-
-router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
-  try {
-    const healthData = req.body;
-    const cacheKey = `predict_simple_groq:${hashCode(JSON.stringify(healthData))}`;
-    
-    const cachedResponse = await getCached(cacheKey);
-    if (cachedResponse) {
-      logger.info(`Returning cached simple prediction`);
-      return res.json({ ...cachedResponse, fromCache: true });
-    }
-
-    const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
-
-    const response = {
-      prediction: {
-        risk_level: riskLevel,
-        risk_factors: riskFactors,
-        recommendation: riskFactors.length > 0 
-          ? `Please discuss these factors with your healthcare provider: ${riskFactors.join(', ')}`
-          : 'Continue with regular prenatal care',
-        confidence: 0.65,
-        sources: ['rule_based_prediction'],
-        health_metrics: {
-          bmi: bmi.toFixed(1),
-          blood_pressure_status: healthData.systolic_bp > 140 || healthData.diastolic_bp > 90 ? 'elevated' : 'normal',
-          gestational_age: healthData.gestational_age
-        }
-      },
-      timestamp: new Date().toISOString(),
-      fromCache: false
-    };
-
-    await setCached(cacheKey, response, CACHE_DURATION);
-    
-    auditLog('predict_simple', null, {
-      risk_level: riskLevel,
-      risk_factors_count: riskFactors.length,
-      input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
-    });
-
-    res.json(response);
-  } catch (error) {
-    logger.error('Predict simple endpoint error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Unable to process prediction request',
-      timestamp: new Date().toISOString(),
-      requestId: req.headers['x-request-id'] || 'unknown'
-    });
-  }
-});
 
 router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
   try {
@@ -1726,83 +1588,6 @@ router.get('/doctors', async (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Unable to fetch doctors',
-      timestamp: new Date().toISOString()
-    });
-  }
-});
-
-// Available slots endpoint (called by ConsultationScreen)
-router.get('/available-slots', async (req, res) => {
-  try {
-    const { doctorId, date } = req.query;
-
-    if (!doctorId || !date) {
-      return res.status(400).json({
-        error: 'Missing required parameters',
-        message: 'doctorId and date are required'
-      });
-    }
-
-    const supabase = getSupabaseClient();
-
-    // Try to fetch real availability from database
-    const { data: bookedSlots, error } = await supabase
-      .from('appointments')
-      .select('appointment_time')
-      .eq('healthcare_provider_id', doctorId)
-      .eq('appointment_date', date)
-      .eq('status', 'confirmed');
-
-    if (error) {
-      logger.warn('Database slots query error:', error);
-    }
-
-    // Generate available slots (9 AM to 5 PM, excluding booked slots)
-    const allSlots = [
-      '09:00 AM', '10:00 AM', '11:00 AM', '12:00 PM',
-      '01:00 PM', '02:00 PM', '03:00 PM', '04:00 PM', '05:00 PM'
-    ];
-
-    const bookedTimes = bookedSlots?.map(slot => slot.appointment_time) || [];
-    const availableSlots = allSlots.filter(slot => !bookedTimes.includes(slot));
-
-    // If it's today or past dates, remove morning slots
-    const selectedDate = new Date(date);
-    const today = new Date();
-    const isToday = selectedDate.toDateString() === today.toDateString();
-    
-    let filteredSlots = availableSlots;
-    if (isToday) {
-      const currentHour = today.getHours();
-      filteredSlots = availableSlots.filter(slot => {
-        const slotHour = parseInt(slot.split(':')[0]);
-        const isPM = slot.includes('PM');
-        const hour24 = isPM && slotHour !== 12 ? slotHour + 12 : slotHour;
-        return hour24 > currentHour;
-      });
-    }
-
-    auditLog('fetch_available_slots', req.user.id, {
-      doctor_id: doctorId,
-      date,
-      available_count: filteredSlots.length,
-      booked_count: bookedTimes.length
-    });
-
-    res.json({
-      slots: filteredSlots,
-      doctorId,
-      date,
-      totalSlots: allSlots.length,
-      bookedSlots: bookedTimes.length,
-      timestamp: new Date().toISOString()
-    });
-
-  } catch (error) {
-    logger.error('Available slots endpoint error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Unable to fetch available slots',
       timestamp: new Date().toISOString()
     });
   }
