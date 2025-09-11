@@ -1,20 +1,21 @@
-// routes/healthTips.js - Fixed Version
+// routes/healthTips.js - Groq Integration Version
 const { getSupabaseClient } = require('../config/database');
 const { getCached, setCached, deleteCached } = require('../config/cache');
 const logger = require('../utils/logger');
+import Groq from "groq-sdk";
 // Fix: Properly import auditLog - check if it's a separate export or part of logger
 const auditLog = logger.auditLog || ((action, userId, data) => {
   logger.info(`Audit: ${action}`, { userId, ...data });
 });
-const axios = require('axios');
 
 const router = require('express').Router();
 
-// Configuration for maternal health API
-const MATERNAL_HEALTH_API_URL = process.env.MATERNAL_HEALTH_API_URL;
-const API_TIMEOUT = parseInt(process.env.API_TIMEOUT) || 8000;
-const DATABASE_FALLBACK_ENABLED = process.env.DATABASE_FALLBACK_ENABLED !== 'false';
+// Initialize Groq client
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// Configuration
 const CACHE_DURATION = parseInt(process.env.CACHE_DURATION) || 3600;
+const DATABASE_FALLBACK_ENABLED = process.env.DATABASE_FALLBACK_ENABLED !== 'false';
 
 // Helper function to safely calculate gestational week
 function calculateGestationalWeek(startDate) {
@@ -388,31 +389,160 @@ function prepareMaternalHealthInput(healthData) {
   };
 }
 
-// Helper function for simple risk assessment
+// Groq-based AI Health Recommendations
+async function getGroqHealthRecommendations(healthData) {
+  try {
+    const prompt = `You are a maternal health AI assistant. Based on the following health data, provide personalized health recommendations in JSON format.
+
+Health Data:
+- Age: ${healthData.age} years
+- Gestational week: ${healthData.gestational_week}
+- Blood pressure: ${healthData.systolic_bp}/${healthData.diastolic_bp} mmHg
+- Heart rate: ${healthData.heart_rate} bpm
+- BMI: ${healthData.bmi}
+- Blood sugar: ${healthData.blood_sugar} mg/dL
+- Body temperature: ${healthData.body_temp}°F
+- Previous pregnancies: ${healthData.previous_pregnancies}
+- Weight gain: ${healthData.weight_gain} lbs
+
+Please respond with a JSON object containing:
+{
+  "category": "one of: General Focus, Nutrition Focus, Exercise Focus, Wellness Focus",
+  "confidence": 0.8,
+  "tips": ["tip1", "tip2", "tip3"],
+  "focus_area": "brief description of main focus area",
+  "source": "groq-ai"
+}
+
+Focus on practical, safe recommendations appropriate for pregnancy. Always include disclaimer about consulting healthcare provider.`;
+
+    const completion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: "You are a maternal health AI assistant. Provide safe, evidence-based pregnancy health recommendations. Always remind users to consult their healthcare provider. Respond only in valid JSON format."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      model: "llama3-8b-8192",
+      temperature: 0.3,
+      max_tokens: 500
+    });
+
+    const responseText = completion.choices[0]?.message?.content;
+    if (!responseText) {
+      throw new Error('No response from Groq');
+    }
+
+    // Clean and parse JSON response
+    const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const recommendations = JSON.parse(cleanedResponse);
+
+    logger.info('Groq health recommendations generated successfully');
+    return recommendations;
+
+  } catch (error) {
+    logger.error('Error getting Groq health recommendations:', error);
+    return null;
+  }
+}
+
+// Groq-based Risk Assessment
+async function getGroqRiskAssessment(healthData) {
+  try {
+    const prompt = `You are a maternal health AI assistant. Analyze the following health data and provide a risk assessment in JSON format.
+
+Health Data:
+- Age: ${healthData.age} years
+- Gestational week: ${healthData.gestational_week}
+- Blood pressure: ${healthData.systolic_bp}/${healthData.diastolic_bp} mmHg
+- Heart rate: ${healthData.heart_rate} bpm
+- BMI: ${healthData.bmi}
+- Blood sugar: ${healthData.blood_sugar} mg/dL
+- Body temperature: ${healthData.body_temp}°F
+- Previous pregnancies: ${healthData.previous_pregnancies}
+- Weight gain: ${healthData.weight_gain} lbs
+
+Please respond with a JSON object containing:
+{
+  "risk_level": "Low Risk, Medium Risk, or High Risk",
+  "confidence": 0.8,
+  "recommendation": "specific recommendation based on risk level",
+  "risk_factors": ["factor1", "factor2"],
+  "source": "groq-ai"
+}
+
+Base assessment on standard obstetric guidelines. Always recommend consulting healthcare provider for concerning values.`;
+
+    const completion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: "You are a maternal health AI assistant. Provide evidence-based pregnancy risk assessments. Always emphasize consulting healthcare providers. Respond only in valid JSON format."
+        },
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      model: "llama3-8b-8192",
+      temperature: 0.2,
+      max_tokens: 400
+    });
+
+    const responseText = completion.choices[0]?.message?.content;
+    if (!responseText) {
+      throw new Error('No response from Groq');
+    }
+
+    // Clean and parse JSON response
+    const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+    const riskAssessment = JSON.parse(cleanedResponse);
+
+    logger.info('Groq risk assessment generated successfully');
+    return riskAssessment;
+
+  } catch (error) {
+    logger.error('Error getting Groq risk assessment:', error);
+    return null;
+  }
+}
+
+// Helper function for simple rule-based risk assessment (fallback)
 function simpleRiskAssessment(healthData) {
-  const bmi = healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2);
-  let riskLevel = 'Low';
+  const bmi = healthData.weight_pre_pregnancy ? 
+    healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2) :
+    healthData.bmi || 24;
+    
+  let riskLevel = 'Low Risk';
   const riskFactors = [];
 
   if (healthData.systolic_bp > 140 || healthData.diastolic_bp > 90) {
-    riskLevel = 'Medium';
+    riskLevel = 'Medium Risk';
     riskFactors.push('elevated blood pressure');
   }
   if (bmi > 30 || bmi < 18.5) {
-    riskLevel = 'Medium';
+    riskLevel = 'Medium Risk';
     riskFactors.push('BMI concerns');
   }
-  if (healthData.gestational_age > 37) {
-    riskLevel = 'Medium';
+  if (healthData.gestational_age && healthData.gestational_age > 37) {
+    riskLevel = 'Medium Risk';
     riskFactors.push('advanced gestational age');
   }
   if (healthData.age > 35) {
-    riskLevel = 'Medium';
+    riskLevel = 'Medium Risk';
     riskFactors.push('advanced maternal age');
+  }
+  if (healthData.blood_sugar > 125) {
+    riskLevel = 'Medium Risk';
+    riskFactors.push('elevated blood sugar');
   }
 
   if (riskFactors.length > 2) {
-    riskLevel = 'High';
+    riskLevel = 'High Risk';
   }
 
   return { riskLevel, riskFactors, bmi };
@@ -429,11 +559,11 @@ function hashCode(str) {
   return hash;
 }
 
-// Main health tips endpoint - Enhanced with better fallbacks
+// Main health tips endpoint - Enhanced with Groq integration
 router.get('/', async (req, res) => {
   try {
     const supabase = getSupabaseClient();
-    const cacheKey = `health_tips_v3:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
+    const cacheKey = `health_tips_groq:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
 
     // Check for force refresh parameter
     const forceRefresh = req.query.refresh === 'true';
@@ -465,60 +595,48 @@ router.get('/', async (req, res) => {
     let dataSource = 'rule-based';
     let apiErrors = [];
 
-    // Only try AI APIs if URL is properly configured
-    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL) {
-      try {
-        logger.info(`Attempting AI API calls to ${MATERNAL_HEALTH_API_URL} with timeout ${API_TIMEOUT}ms`);
-        
-        // Call maternal health prediction API with better error handling
-        const [tipsResponse, riskResponse] = await Promise.allSettled([
-          axios.post(`${MATERNAL_HEALTH_API_URL}/health-tips`, maternalInput, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: API_TIMEOUT
-          }),
-          axios.post(`${MATERNAL_HEALTH_API_URL}/risk-assessment`, maternalInput, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: API_TIMEOUT
-          })
-        ]);
+    // Try Groq AI APIs
+    try {
+      logger.info('Attempting Groq AI calls for health recommendations and risk assessment');
+      
+      // Call Groq for both recommendations and risk assessment
+      const [recommendationsResult, riskResult] = await Promise.allSettled([
+        getGroqHealthRecommendations(maternalInput),
+        getGroqRiskAssessment(maternalInput)
+      ]);
 
-        // Process tips response
-        if (tipsResponse.status === 'fulfilled') {
-          aiRecommendations = tipsResponse.value.data;
-          logger.info('AI health tips API successful');
-        } else {
-          apiErrors.push(`Health tips API: ${tipsResponse.reason.message}`);
-          logger.warn('Health tips API failed:', tipsResponse.reason.message);
-        }
+      // Process recommendations response
+      if (recommendationsResult.status === 'fulfilled' && recommendationsResult.value) {
+        aiRecommendations = recommendationsResult.value;
+        logger.info('Groq health recommendations successful');
+      } else {
+        apiErrors.push(`Health recommendations: ${recommendationsResult.reason?.message || 'Failed'}`);
+        logger.warn('Groq health recommendations failed:', recommendationsResult.reason);
+      }
 
-        // Process risk response
-        if (riskResponse.status === 'fulfilled') {
-          riskAssessment = riskResponse.value.data;
-          logger.info('AI risk assessment API successful');
-        } else {
-          apiErrors.push(`Risk assessment API: ${riskResponse.reason.message}`);
-          logger.warn('Risk assessment API failed:', riskResponse.reason.message);
-        }
+      // Process risk assessment response
+      if (riskResult.status === 'fulfilled' && riskResult.value) {
+        riskAssessment = riskResult.value;
+        logger.info('Groq risk assessment successful');
+      } else {
+        apiErrors.push(`Risk assessment: ${riskResult.reason?.message || 'Failed'}`);
+        logger.warn('Groq risk assessment failed:', riskResult.reason);
+      }
 
-        // If we got at least one successful response, mark as AI
-        if (aiRecommendations || riskAssessment) {
-          dataSource = 'ai-model';
-          logger.info(`AI prediction partially successful for user ${req.user.id}`, {
-            has_recommendations: !!aiRecommendations,
-            has_risk_assessment: !!riskAssessment
-          });
-        } else {
-          dataSource = 'fallback-rules';
-        }
-
-      } catch (apiError) {
-        logger.error('Maternal health API error:', apiError.message);
-        apiErrors.push(`General API error: ${apiError.message}`);
+      // If we got at least one successful response, mark as AI
+      if (aiRecommendations || riskAssessment) {
+        dataSource = 'groq-ai';
+        logger.info(`Groq AI partially successful for user ${req.user.id}`, {
+          has_recommendations: !!aiRecommendations,
+          has_risk_assessment: !!riskAssessment
+        });
+      } else {
         dataSource = 'fallback-rules';
       }
-    } else {
-      logger.info('AI API URL not configured or using localhost, skipping AI calls');
-      apiErrors.push('AI API not configured');
+
+    } catch (apiError) {
+      logger.error('Groq AI error:', apiError.message);
+      apiErrors.push(`Groq API error: ${apiError.message}`);
       dataSource = 'fallback-rules';
     }
 
@@ -558,7 +676,7 @@ router.get('/', async (req, res) => {
       healthTips = createDefaultHealthTips(category, healthData.gestationalWeek);
     }
 
-    // Generate fallback recommendations if AI failed
+    // Generate fallback recommendations if Groq failed
     let fallbackRecommendations = null;
     if (!aiRecommendations) {
       const categoryTips = {
@@ -643,8 +761,7 @@ router.get('/', async (req, res) => {
         errors: apiErrors,
         healthTipsAPI: !!aiRecommendations ? 'success' : 'failed',
         riskAssessmentAPI: !!riskAssessment ? 'success' : 'failed',
-        apiUrl: MATERNAL_HEALTH_API_URL,
-        timeout: API_TIMEOUT
+        aiProvider: 'groq'
       },
       personalizedFor: {
         age: maternalInput.age,
@@ -672,7 +789,7 @@ router.get('/', async (req, res) => {
     logger.info(`Health tips cached for user ${req.user.id}, category: ${category}, tips: ${(healthTips || []).length}`);
 
     // Audit log with enhanced details
-    auditLog('fetch_health_tips_ai', req.user.id, {
+    auditLog('fetch_health_tips_groq', req.user.id, {
       week: healthData.gestationalWeek,
       source: dataSource,
       risk_level: (riskAssessment || fallbackRiskAssessment)?.risk_level,
@@ -794,11 +911,11 @@ const validateAdminAuth = (req, res, next) => {
   next();
 };
 
-// Prediction Endpoints
+// Prediction Endpoints - Updated to use Groq
 router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `predict:${hashCode(JSON.stringify(healthData))}`;
+    const cacheKey = `predict_groq:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -806,10 +923,32 @@ router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
       return res.json({ ...cachedResponse, fromCache: true });
     }
 
+    // Try Groq AI first
+    const maternalInput = {
+      age: healthData.age,
+      gestational_week: healthData.gestational_age,
+      systolic_bp: healthData.systolic_bp,
+      diastolic_bp: healthData.diastolic_bp,
+      bmi: healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2),
+      heart_rate: healthData.heart_rate || 80,
+      blood_sugar: healthData.blood_sugar || 95,
+      body_temp: healthData.body_temp || 98.6,
+      previous_pregnancies: healthData.previous_pregnancies || 0,
+      weight_gain: healthData.weight_gain || 25
+    };
+
+    let groqPrediction = null;
+    try {
+      groqPrediction = await getGroqRiskAssessment(maternalInput);
+    } catch (error) {
+      logger.warn('Groq prediction failed, using fallback:', error);
+    }
+
+    // Fallback to simple assessment if Groq fails
     const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
 
     const response = {
-      prediction: {
+      prediction: groqPrediction || {
         risk_level: riskLevel,
         risk_factors: riskFactors,
         recommendation: riskFactors.length > 0 
@@ -823,6 +962,7 @@ router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
           gestational_age: healthData.gestational_age
         }
       },
+      dataSource: groqPrediction ? 'groq-ai' : 'rule-based',
       timestamp: new Date().toISOString(),
       fromCache: false
     };
@@ -830,8 +970,9 @@ router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
     await setCached(cacheKey, response, CACHE_DURATION);
     
     auditLog('predict_comprehensive', null, {
-      risk_level: riskLevel,
-      risk_factors_count: riskFactors.length,
+      risk_level: response.prediction.risk_level,
+      risk_factors_count: (response.prediction.risk_factors || []).length,
+      data_source: response.dataSource,
       input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
     });
 
@@ -850,7 +991,7 @@ router.post('/predict', validateComprehensiveHealthInput, async (req, res) => {
 router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `predict_simple:${hashCode(JSON.stringify(healthData))}`;
+    const cacheKey = `predict_simple_groq:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -902,7 +1043,7 @@ router.post('/predict-simple', validateBasicHealthInput, async (req, res) => {
 router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `risk_assessment:${hashCode(JSON.stringify(healthData))}`;
+    const cacheKey = `risk_assessment_groq:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -910,10 +1051,32 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
       return res.json({ ...cachedResponse, fromCache: true });
     }
 
+    // Prepare data for Groq
+    const maternalInput = {
+      age: healthData.age,
+      gestational_week: healthData.gestational_age,
+      systolic_bp: healthData.systolic_bp,
+      diastolic_bp: healthData.diastolic_bp,
+      bmi: healthData.weight_pre_pregnancy / ((healthData.height / 100) ** 2),
+      heart_rate: healthData.heart_rate || 80,
+      blood_sugar: healthData.blood_sugar || 95,
+      body_temp: healthData.body_temp || 98.6,
+      previous_pregnancies: healthData.previous_pregnancies || 0,
+      weight_gain: healthData.weight_gain || 25
+    };
+
+    let groqAssessment = null;
+    try {
+      groqAssessment = await getGroqRiskAssessment(maternalInput);
+    } catch (error) {
+      logger.warn('Groq risk assessment failed, using fallback:', error);
+    }
+
+    // Fallback to simple assessment
     const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
 
     const response = {
-      risk_assessment: {
+      risk_assessment: groqAssessment || {
         risk_level: riskLevel,
         risk_factors: riskFactors,
         recommendation: riskFactors.length > 0 
@@ -927,6 +1090,7 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
           gestational_age: healthData.gestational_age
         }
       },
+      dataSource: groqAssessment ? 'groq-ai' : 'rule-based',
       timestamp: new Date().toISOString(),
       fromCache: false
     };
@@ -934,8 +1098,9 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
     await setCached(cacheKey, response, CACHE_DURATION);
     
     auditLog('risk_assessment', null, {
-      risk_level: riskLevel,
-      risk_factors_count: riskFactors.length,
+      risk_level: response.risk_assessment.risk_level,
+      risk_factors_count: (response.risk_assessment.risk_factors || []).length,
+      data_source: response.dataSource,
       input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
     });
 
@@ -951,68 +1116,84 @@ router.post('/risk-assessment', validateBasicHealthInput, async (req, res) => {
   }
 });
 
-// Chat Endpoints
-router.post('/chat', validateChatInput, async (req, res) => {
+// Enhanced Chat Endpoint with Groq
+router.post("/chat", async (req, res) => {
   try {
     const { message, user_id } = req.body;
-    const cacheKey = `chat:${user_id}:${hashCode(message)}`;
-    
-    const cachedResponse = await getCached(cacheKey);
-    if (cachedResponse) {
-      logger.info(`Returning cached chat response for user ${user_id}`);
-      return res.json({ ...cachedResponse, fromCache: true });
+
+    if (!message) {
+      return res.status(400).json({
+        error: 'Invalid input',
+        message: 'Message is required',
+        timestamp: new Date().toISOString()
+      });
     }
 
-    const supabase = getSupabaseClient();
-    const pregnancyData = await getUserHealthData(user_id, supabase);
-
-    let responseContent;
-    if (message.toLowerCase().includes('labor') && message.toLowerCase().includes('anxious')) {
-      responseContent = {
-        message: 'Feeling anxious about labor is common, especially at 28 weeks. Labor typically involves three stages: early labor (mild contractions, cervical dilation), active labor (stronger contractions every 3-5 minutes), and pushing/delivery. To ease anxiety, consider prenatal classes, discuss your concerns with your healthcare provider, and practice relaxation techniques like deep breathing. Would you like specific coping strategies?',
-        confidence: 0.85,
-        sources: ['general_medical_knowledge', 'mental_health_guidance'],
-        timestamp: new Date().toISOString()
-      };
-    } else if (message.toLowerCase().includes('labor')) {
-      responseContent = {
-        message: 'During labor, the body goes through several stages: early labor (mild contractions, cervical dilation), active labor (stronger contractions every 3-5 minutes), transition (intense contractions), and pushing/delivery. The placenta is delivered last. Always consult your healthcare provider for personalized guidance.',
-        confidence: 0.85,
-        sources: ['general_medical_knowledge'],
-        timestamp: new Date().toISOString()
-      };
-    } else {
-      responseContent = {
-        message: 'I can provide information about pregnancy and maternal health. Could you please provide more specific details or ask about a particular topic?',
-        confidence: 0.5,
-        sources: ['general_response'],
-        timestamp: new Date().toISOString()
-      };
+    // Get user context if user_id is provided
+    let userContext = '';
+    if (user_id) {
+      try {
+        const supabase = getSupabaseClient();
+        const healthData = await getUserHealthData(user_id, supabase);
+        if (healthData && healthData.gestationalWeek) {
+          userContext = `\n\nUser Context: Currently at ${healthData.gestationalWeek} weeks of pregnancy.`;
+        }
+      } catch (error) {
+        logger.warn('Could not fetch user context for chat:', error);
+      }
     }
 
-    const response = {
-      response: responseContent,
-      user_id,
-      pregnancy_status: pregnancyData ? 'active' : 'no_active_pregnancy',
-      fromCache: false
-    };
+    const chatCompletion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: `You are a maternal health assistant specializing in pregnancy care and support. 
 
-    await setCached(cacheKey, response, CACHE_DURATION);
-    
-    auditLog('chat_endpoint', user_id, {
-      message,
-      response_length: responseContent.message.length,
-      has_pregnancy: !!pregnancyData
+Guidelines:
+- Only discuss pregnancy, maternal care, childbirth, and related health topics
+- Always include a disclaimer that this is not medical advice and users should consult healthcare providers
+- Provide evidence-based, safe information
+- Be empathetic and supportive while maintaining professional boundaries
+- If asked about non-pregnancy topics, politely redirect to pregnancy-related matters
+- Keep responses concise but informative (2-3 paragraphs max)
+- Always encourage regular prenatal care
+
+${userContext}`
+        },
+        { role: "user", content: message },
+      ],
+      model: "llama3-8b-8192",
+      temperature: 0.7,
+      max_tokens: 500
     });
 
-    res.json(response);
-  } catch (error) {
-    logger.error('Chat endpoint error:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Unable to process chat request',
+    const reply = chatCompletion.choices[0]?.message?.content;
+
+    if (!reply) {
+      throw new Error('No response generated');
+    }
+
+    // Audit log
+    if (user_id) {
+      auditLog('chat_groq', user_id, {
+        message_length: message.length,
+        response_length: reply.length,
+        has_user_context: !!userContext
+      });
+    }
+
+    res.json({ 
+      reply,
       timestamp: new Date().toISOString(),
-      requestId: req.headers['x-request-id'] || 'unknown'
+      source: 'groq-ai'
+    });
+
+  } catch (err) {
+    logger.error('Chat endpoint error:', err);
+    res.status(500).json({ 
+      error: 'Unable to process chat request',
+      message: err.message,
+      timestamp: new Date().toISOString()
     });
   }
 });
@@ -1020,7 +1201,7 @@ router.post('/chat', validateChatInput, async (req, res) => {
 router.post('/integrated-consultation', validateIntegratedConsultationInput, async (req, res) => {
   try {
     const { message, user_id, health_data } = req.body;
-    const cacheKey = `integrated_consultation:${user_id}:${hashCode(message)}:${hashCode(JSON.stringify(health_data))}`;
+    const cacheKey = `integrated_consultation_groq:${user_id}:${hashCode(message)}:${hashCode(JSON.stringify(health_data))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -1032,12 +1213,54 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
     const pregnancyData = await getUserHealthData(user_id, supabase);
     const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(health_data);
 
+    // Prepare detailed health context for Groq
+    const healthContext = `
+Patient Health Data:
+- Age: ${health_data.age} years
+- Gestational Age: ${health_data.gestational_age} weeks
+- Blood Pressure: ${health_data.systolic_bp}/${health_data.diastolic_bp} mmHg
+- BMI: ${bmi.toFixed(1)}
+- Risk Level: ${riskLevel}
+- Risk Factors: ${riskFactors.join(', ') || 'None identified'}
+
+Patient Question: ${message}
+    `;
+
+    let groqResponse = null;
+    try {
+      const consultation = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system",
+            content: `You are a maternal health AI assistant providing consultation based on health data and patient questions.
+
+Guidelines:
+- Analyze the provided health data in context of the patient's question
+- Provide personalized, evidence-based guidance
+- Always emphasize consulting healthcare providers for concerning symptoms
+- Be empathetic and supportive
+- Keep responses focused and actionable (2-3 paragraphs)
+- Include specific recommendations based on risk factors if any
+- Always include medical disclaimer`
+          },
+          { role: "user", content: healthContext }
+        ],
+        model: "llama3-8b-8192",
+        temperature: 0.6,
+        max_tokens: 600
+      });
+
+      groqResponse = consultation.choices[0]?.message?.content;
+    } catch (error) {
+      logger.warn('Groq consultation failed:', error);
+    }
+
     let responseContent;
-    if (message.toLowerCase().includes('concern')) {
+    if (groqResponse) {
       responseContent = {
-        message: `Based on your health data (BP: ${health_data.systolic_bp}/${health_data.diastolic_bp}, BMI: ${bmi.toFixed(1)}), your risk level is ${riskLevel}. ${riskFactors.length > 0 ? 'Noted concerns: ' + riskFactors.join(', ') + '. Please consult your healthcare provider.' : 'No immediate concerns detected, but regular checkups are recommended.'}`,
-        confidence: 0.7,
-        sources: ['rule_based_assessment', 'provided_health_data'],
+        message: groqResponse,
+        confidence: 0.8,
+        sources: ['groq-ai', 'provided_health_data'],
         health_metrics: {
           bmi: bmi.toFixed(1),
           blood_pressure_status: health_data.systolic_bp > 140 || health_data.diastolic_bp > 90 ? 'elevated' : 'normal',
@@ -1046,10 +1269,13 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
         timestamp: new Date().toISOString()
       };
     } else {
+      // Fallback response
       responseContent = {
-        message: 'Your health data has been received. Please provide more specific questions for detailed guidance.',
-        confidence: 0.5,
-        sources: ['general_response'],
+        message: `Based on your health data (BP: ${health_data.systolic_bp}/${health_data.diastolic_bp}, BMI: ${bmi.toFixed(1)}), your risk level is ${riskLevel}. ${riskFactors.length > 0 ? 'Areas of concern: ' + riskFactors.join(', ') + '. Please discuss these with your healthcare provider.' : 'No immediate concerns detected, but regular checkups are recommended.'} 
+
+Please consult your healthcare provider for personalized medical advice regarding your specific question.`,
+        confidence: 0.7,
+        sources: ['rule_based_assessment', 'provided_health_data'],
         health_metrics: {
           bmi: bmi.toFixed(1),
           blood_pressure_status: health_data.systolic_bp > 140 || health_data.diastolic_bp > 90 ? 'elevated' : 'normal',
@@ -1065,6 +1291,7 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
       risk_level: riskLevel,
       risk_factors: riskFactors,
       pregnancy_status: pregnancyData ? 'active' : 'no_active_pregnancy',
+      dataSource: groqResponse ? 'groq-ai' : 'rule-based',
       fromCache: false
     };
 
@@ -1074,7 +1301,8 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
       message,
       risk_level: riskLevel,
       risk_factors_count: riskFactors.length,
-      has_pregnancy: !!pregnancyData
+      has_pregnancy: !!pregnancyData,
+      data_source: response.dataSource
     });
 
     res.json(response);
@@ -1089,11 +1317,11 @@ router.post('/integrated-consultation', validateIntegratedConsultationInput, asy
   }
 });
 
-// Report Endpoints
+// Report Endpoints - Updated with Groq
 router.post('/health-report', validateComprehensiveHealthInput, async (req, res) => {
   try {
     const healthData = req.body;
-    const cacheKey = `health_report:${hashCode(JSON.stringify(healthData))}`;
+    const cacheKey = `health_report_groq:${hashCode(JSON.stringify(healthData))}`;
     
     const cachedResponse = await getCached(cacheKey);
     if (cachedResponse) {
@@ -1103,8 +1331,50 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
 
     const { riskLevel, riskFactors, bmi } = simpleRiskAssessment(healthData);
 
+    // Try to get Groq-generated health report
+    let groqReport = null;
+    try {
+      const reportPrompt = `Generate a comprehensive health report for a pregnant patient with the following data:
+
+Age: ${healthData.age} years
+Gestational Age: ${healthData.gestational_age} weeks  
+Blood Pressure: ${healthData.systolic_bp}/${healthData.diastolic_bp} mmHg
+BMI: ${bmi.toFixed(1)}
+Risk Factors: ${riskFactors.join(', ') || 'None identified'}
+
+Provide a JSON response with:
+{
+  "risk_level": "${riskLevel}",
+  "recommendations": ["rec1", "rec2", "rec3"],
+  "health_summary": "brief summary of overall health status",
+  "next_steps": ["step1", "step2"],
+  "source": "groq-ai"
+}`;
+
+      const completion = await groq.chat.completions.create({
+        messages: [
+          {
+            role: "system", 
+            content: "You are a maternal health AI generating comprehensive health reports. Respond only in valid JSON format."
+          },
+          { role: "user", content: reportPrompt }
+        ],
+        model: "llama3-8b-8192",
+        temperature: 0.3,
+        max_tokens: 500
+      });
+
+      const responseText = completion.choices[0]?.message?.content;
+      if (responseText) {
+        const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+        groqReport = JSON.parse(cleanedResponse);
+      }
+    } catch (error) {
+      logger.warn('Groq health report failed:', error);
+    }
+
     const response = {
-      health_report: {
+      health_report: groqReport || {
         risk_level: riskLevel,
         risk_factors: riskFactors,
         recommendations: [
@@ -1123,6 +1393,7 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
         sources: ['rule_based_report', 'health_data'],
         timestamp: new Date().toISOString()
       },
+      dataSource: groqReport ? 'groq-ai' : 'rule-based',
       fromCache: false
     };
 
@@ -1131,6 +1402,7 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
     auditLog('health_report', null, {
       risk_level: riskLevel,
       risk_factors_count: riskFactors.length,
+      data_source: response.dataSource,
       input_metrics: { age: healthData.age, gestational_age: healthData.gestational_age, bmi: bmi.toFixed(1) }
     });
 
@@ -1146,11 +1418,11 @@ router.post('/health-report', validateComprehensiveHealthInput, async (req, res)
   }
 });
 
-// Health Assessment endpoint (called by HealthAssessmentScreen)
+// Health Assessment endpoint - Updated with Groq
 router.get('/health-assessment', async (req, res) => {
   try {
     const supabase = getSupabaseClient();
-    const cacheKey = `health_assessment:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
+    const cacheKey = `health_assessment_groq:${req.user.id}:${new Date().toISOString().split('T')[0]}`;
 
     // Check cache first
     const cachedAssessment = await getCached(cacheKey);
@@ -1170,34 +1442,26 @@ router.get('/health-assessment', async (req, res) => {
     let riskAssessment = null;
     let dataSource = 'rule-based';
 
-    // Try AI APIs if configured
-    if (MATERNAL_HEALTH_API_URL && MATERNAL_HEALTH_API_URL) {
-      try {
-        const [tipsResponse, riskResponse] = await Promise.allSettled([
-          axios.post(`${MATERNAL_HEALTH_API_URL}/health-tips`, maternalInput, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: API_TIMEOUT
-          }),
-          axios.post(`${MATERNAL_HEALTH_API_URL}/risk-assessment`, maternalInput, {
-            headers: { 'Content-Type': 'application/json' },
-            timeout: API_TIMEOUT
-          })
-        ]);
+    // Try Groq APIs
+    try {
+      const [tipsResult, riskResult] = await Promise.allSettled([
+        getGroqHealthRecommendations(maternalInput),
+        getGroqRiskAssessment(maternalInput)
+      ]);
 
-        if (tipsResponse.status === 'fulfilled') {
-          aiRecommendations = tipsResponse.value.data;
-        }
-
-        if (riskResponse.status === 'fulfilled') {
-          riskAssessment = riskResponse.value.data;
-        }
-
-        if (aiRecommendations || riskAssessment) {
-          dataSource = 'ai-model';
-        }
-      } catch (error) {
-        logger.error('AI API error in health assessment:', error);
+      if (tipsResult.status === 'fulfilled' && tipsResult.value) {
+        aiRecommendations = tipsResult.value;
       }
+
+      if (riskResult.status === 'fulfilled' && riskResult.value) {
+        riskAssessment = riskResult.value;
+      }
+
+      if (aiRecommendations || riskAssessment) {
+        dataSource = 'groq-ai';
+      }
+    } catch (error) {
+      logger.error('Groq API error in health assessment:', error);
     }
 
     // Generate fallback risk assessment if needed
@@ -1292,7 +1556,7 @@ router.get('/health-assessment', async (req, res) => {
   }
 });
 
-// Detailed Report endpoint (called by DetailedReportScreen)
+// Detailed Report endpoint - Updated with Groq
 router.get('/detailed-report', async (req, res) => {
   try {
     const supabase = getSupabaseClient();
@@ -1309,16 +1573,40 @@ router.get('/detailed-report', async (req, res) => {
       diastolic_bp: maternalInput.diastolic_bp
     });
 
+    // Try to get Groq-enhanced detailed report
+    let groqAssessment = null;
+    let groqRecommendations = null;
+    let dataSource = 'rule-based';
+
+    try {
+      const [assessmentResult, recommendationsResult] = await Promise.allSettled([
+        getGroqRiskAssessment(maternalInput),
+        getGroqHealthRecommendations(maternalInput)
+      ]);
+
+      if (assessmentResult.status === 'fulfilled' && assessmentResult.value) {
+        groqAssessment = assessmentResult.value;
+        dataSource = 'groq-ai';
+      }
+
+      if (recommendationsResult.status === 'fulfilled' && recommendationsResult.value) {
+        groqRecommendations = recommendationsResult.value;
+        dataSource = 'groq-ai';
+      }
+    } catch (error) {
+      logger.warn('Groq detailed report failed:', error);
+    }
+
     const response = {
       assessmentData: {
-        riskAssessment: {
+        riskAssessment: groqAssessment || {
           risk_level: riskLevel,
           confidence: 0.75,
           recommendation: riskFactors.length > 0 
             ? `Key areas to discuss with your healthcare provider: ${riskFactors.join(', ')}`
             : 'Your current health metrics show no immediate concerns. Continue with regular prenatal care.'
         },
-        aiRecommendations: {
+        aiRecommendations: groqRecommendations || {
           category: 'General Focus',
           confidence: 0.7,
           tips: [
@@ -1347,11 +1635,13 @@ router.get('/detailed-report', async (req, res) => {
           impact: maternalInput.systolic_bp > 140 ? 'Increased risk of preeclampsia' : 'Healthy cardiovascular status',
           recommendation: maternalInput.systolic_bp > 140 ? 'Regular BP monitoring and lifestyle modifications' : 'Maintain current healthy habits'
         }
-      ]
+      ],
+      dataSource
     };
 
     auditLog('detailed_report', req.user.id, {
       risk_level: riskLevel,
+      data_source: dataSource,
       week: healthData.gestationalWeek
     });
 
@@ -1614,9 +1904,11 @@ router.delete('/cache/:userId', async (req, res) => {
     const today = new Date().toISOString().split('T')[0];
     
     const cacheKeys = [
-      `health_tips_v3:${userId}:${today}`,
-      `assessment:${userId}:${today}`,
-      `health_tips_v2:${userId}:${today}` // Legacy key
+      `health_tips_groq:${userId}:${today}`,
+      `health_assessment_groq:${userId}:${today}`,
+      `health_tips_v3:${userId}:${today}`, // Legacy key
+      `health_tips_v2:${userId}:${today}`, // Legacy key
+      `assessment:${userId}:${today}` // Legacy key
     ];
 
     for (const key of cacheKeys) {
@@ -1633,6 +1925,50 @@ router.delete('/cache/:userId', async (req, res) => {
   } catch (error) {
     logger.error('Clear user cache error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Add endpoint to test Groq connection
+router.get('/debug/groq-test', async (req, res) => {
+  try {
+    if (!process.env.GROQ_API_KEY) {
+      return res.status(500).json({
+        error: 'GROQ_API_KEY not configured',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    const testCompletion = await groq.chat.completions.create({
+      messages: [
+        {
+          role: "system",
+          content: "You are a test assistant. Respond with 'Groq connection successful' if you receive this message."
+        },
+        {
+          role: "user", 
+          content: "Test connection"
+        }
+      ],
+      model: "llama3-8b-8192",
+      max_tokens: 50
+    });
+
+    const response = testCompletion.choices[0]?.message?.content;
+
+    res.json({
+      status: 'success',
+      response,
+      model: 'llama3-8b-8192',
+      timestamp: new Date().toISOString()
+    });
+
+  } catch (error) {
+    logger.error('Groq test error:', error);
+    res.status(500).json({
+      error: 'Groq connection failed',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
